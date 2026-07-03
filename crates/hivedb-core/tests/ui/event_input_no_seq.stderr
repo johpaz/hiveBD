@@ -1,0 +1,15 @@
+error[E0560]: struct `EventInput` has no field named `seq`
+ --> tests/ui/event_input_no_seq.rs:8:9
+  |
+8 |         seq: 1,
+  |         ^^^ `EventInput` does not have this field
+  |
+  = note: all struct fields are already assigned
+
+error[E0560]: struct `EventInput` has no field named `timestamp`
+ --> tests/ui/event_input_no_seq.rs:9:9
+  |
+9 |         timestamp: 0,
+  |         ^^^^^^^^^ `EventInput` does not have this field
+  |
+  = note: all struct fields are already assigned

@@ -1,0 +1,54 @@
+{
+  "name": "@johpaz/hive-db",
+  "version": "0.1.0",
+  "description": "Motor de base de datos embebido, local-first y agent-native: event-log inmutable, proyecciones deterministas, búsqueda híbrida BM25+ANN y grafo de consentimiento.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/johpaz/hive-db.git"
+  },
+  "keywords": [
+    "database",
+    "embedded",
+    "event-sourcing",
+    "agent",
+    "vector-search",
+    "bm25",
+    "local-first",
+    "napi-rs"
+  ],
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "bun": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build:napi": "cargo build -p hivedb-napi --release && cp ../../target/release/libhivedb_napi.so ./hivedb-napi.node",
+    "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "bun run build",
+    "test": "bun test"
+  },
+  "optionalDependencies": {
+    "@johpaz/hive-db-linux-x64-gnu": "0.1.0",
+    "@johpaz/hive-db-linux-arm64-gnu": "0.1.0",
+    "@johpaz/hive-db-darwin-x64": "0.1.0",
+    "@johpaz/hive-db-darwin-arm64": "0.1.0",
+    "@johpaz/hive-db-win32-x64-msvc": "0.1.0"
+  },
+  "devDependencies": {
+    "bun-types": "latest",
+    "typescript": "^5"
+  }
+}

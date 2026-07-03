@@ -1,0 +1,14 @@
+{
+  "name": "@johpaz/hive-db-win32-x64-msvc",
+  "version": "0.1.0",
+  "description": "Binario nativo de HiveDB para Windows x64 (MSVC).",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/johpaz/hive-db.git"
+  },
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "main": "hivedb-napi.node",
+  "files": ["hivedb-napi.node"]
+}

@@ -1,0 +1,14 @@
+{
+  "name": "@johpaz/hive-db-darwin-x64",
+  "version": "0.1.0",
+  "description": "Binario nativo de HiveDB para macOS x64 (Intel).",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/johpaz/hive-db.git"
+  },
+  "os": ["darwin"],
+  "cpu": ["x64"],
+  "main": "hivedb-napi.node",
+  "files": ["hivedb-napi.node"]
+}

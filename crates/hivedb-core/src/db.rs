@@ -1,0 +1,382 @@
+use crate::clock::{Clock, SystemClock, into_clock};
+use crate::error::HiveResult;
+use crate::event::{AgentId, Event, EventInput, EventKind, StreamId};
+use crate::log::EventLog;
+use crate::memory::WorkingMemory;
+#[cfg(any(test, loom))]
+use crate::memory_log::MemoryEventLog;
+use crate::projection::{Projection, ProjectionRegistry};
+use crate::reactive::{EventPattern, ReactiveEngine, Subscription};
+use crate::state::{
+    consent_graph::ConsentGraph, current_facts::CurrentFacts, task_state::TaskState,
+};
+use hivedb_index::{Hit, HybridQuery, ScalarFilter, SemanticIndex};
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+const VECTOR_DIMENSION: usize = 384;
+
+/// Public handle to a HiveDB database.
+///
+/// All writes happen through [`HiveDB::append`]; the log is immutable once an
+/// event receives a `seq`.
+#[derive(Clone)]
+pub struct HiveDB {
+    log: LogHandle,
+    working: Arc<WorkingMemory>,
+    semantic: Option<Arc<SemanticIndex>>,
+    reactive: Arc<ReactiveEngine>,
+    clock: Arc<dyn Clock>,
+    base_path: PathBuf,
+}
+
+/// Internal handle that hides whether the log is backed by sharded `redb`
+/// files or by an in-memory structure used for concurrency model checking.
+#[derive(Clone)]
+enum LogHandle {
+    Redb(Arc<EventLog>),
+    #[cfg(any(test, loom))]
+    Memory(Arc<MemoryEventLog>),
+}
+
+impl LogHandle {
+    fn append(&self, input: EventInput) -> HiveResult<Event> {
+        match self {
+            LogHandle::Redb(log) => log.append(input),
+            #[cfg(any(test, loom))]
+            LogHandle::Memory(log) => log.append(input),
+        }
+    }
+
+    fn read(&self, seq: u64) -> HiveResult<Event> {
+        match self {
+            LogHandle::Redb(log) => log.read(seq),
+            #[cfg(any(test, loom))]
+            LogHandle::Memory(log) => log.read(seq),
+        }
+    }
+
+    fn len(&self) -> HiveResult<u64> {
+        match self {
+            LogHandle::Redb(log) => log.len(),
+            #[cfg(any(test, loom))]
+            LogHandle::Memory(log) => log.len(),
+        }
+    }
+
+    fn read_stream(&self, agent_id: &AgentId, stream_id: &StreamId) -> HiveResult<Vec<Event>> {
+        match self {
+            LogHandle::Redb(log) => log.read_stream(agent_id, stream_id),
+            #[cfg(any(test, loom))]
+            LogHandle::Memory(log) => log.read_stream(agent_id, stream_id),
+        }
+    }
+
+    fn project<P: Projection>(&self) -> HiveResult<P::State> {
+        match self {
+            LogHandle::Redb(log) => log.project::<P>(),
+            #[cfg(any(test, loom))]
+            LogHandle::Memory(log) => log.project::<P>(),
+        }
+    }
+
+    fn projection_checkpoint<P: Projection>(&self) -> HiveResult<u64> {
+        match self {
+            LogHandle::Redb(log) => log.projection_checkpoint::<P>(),
+            #[cfg(any(test, loom))]
+            LogHandle::Memory(_) => Ok(0),
+        }
+    }
+
+    fn wipe_projections_and_rebuild(&self) -> HiveResult<()> {
+        match self {
+            LogHandle::Redb(log) => log.wipe_projections_and_rebuild(),
+            #[cfg(any(test, loom))]
+            LogHandle::Memory(log) => log.wipe_projections_and_rebuild(),
+        }
+    }
+}
+
+impl HiveDB {
+    /// Open a database at the given path, creating it if necessary.
+    pub fn open<P: AsRef<Path>>(path: P) -> HiveResult<Self> {
+        Self::open_with_clock(path, into_clock(SystemClock))
+    }
+
+    /// Open a database with an explicit clock source.
+    #[doc(hidden)]
+    pub fn open_with_clock<P: AsRef<Path>>(path: P, clock: Arc<dyn Clock>) -> HiveResult<Self> {
+        let base = path.as_ref().to_path_buf();
+        std::fs::create_dir_all(&base)?;
+
+        let registry = default_registry();
+        let log = LogHandle::Redb(Arc::new(EventLog::open(&base, registry, clock.clone())?));
+        let working = Arc::new(WorkingMemory::new());
+        let semantic = Some(Arc::new(SemanticIndex::open(&base, VECTOR_DIMENSION)?));
+        let reactive = Arc::new(ReactiveEngine::new());
+
+        Ok(Self {
+            log,
+            working,
+            semantic,
+            reactive,
+            clock,
+            base_path: base,
+        })
+    }
+
+    /// Open a temporary database. The data directory lives for the remainder of
+    /// the process.
+    pub fn open_temp() -> HiveResult<Self> {
+        Self::open_temp_with_clock(into_clock(SystemClock))
+    }
+
+    /// Open an in-memory database for concurrency model checking.
+    ///
+    /// The semantic index still uses a temporary directory because the index
+    /// layer is not loom-aware.
+    #[cfg(any(test, loom))]
+    #[doc(hidden)]
+    pub fn open_in_memory() -> HiveResult<Self> {
+        Self::open_in_memory_with_clock(into_clock(SystemClock))
+    }
+
+    /// Open an in-memory database with an explicit clock source.
+    #[cfg(any(test, loom))]
+    #[doc(hidden)]
+    pub fn open_in_memory_with_clock(clock: Arc<dyn Clock>) -> HiveResult<Self> {
+        let dir = tempfile::tempdir()?;
+        let base = dir.path().to_path_buf();
+        // Leak the TempDir so the files stay alive for the lifetime of the process.
+        let _ = Box::leak(Box::new(dir));
+
+        let log = LogHandle::Memory(Arc::new(MemoryEventLog::new(clock.clone())));
+        let working = Arc::new(WorkingMemory::new());
+        let semantic = None;
+        let reactive = Arc::new(ReactiveEngine::new());
+
+        Ok(Self {
+            log,
+            working,
+            semantic,
+            reactive,
+            clock,
+            base_path: base,
+        })
+    }
+
+    /// Open a temporary database with an explicit clock source.
+    #[doc(hidden)]
+    pub fn open_temp_with_clock(clock: Arc<dyn Clock>) -> HiveResult<Self> {
+        let dir = tempfile::tempdir()?;
+        let base = dir.path().to_path_buf();
+        // Leak the TempDir so the files stay alive for the lifetime of the process.
+        let _ = Box::leak(Box::new(dir));
+
+        let registry = default_registry();
+        let log = LogHandle::Redb(Arc::new(EventLog::open(&base, registry, clock.clone())?));
+        let working = Arc::new(WorkingMemory::new());
+        let semantic = Some(Arc::new(SemanticIndex::open(&base, VECTOR_DIMENSION)?));
+        let reactive = Arc::new(ReactiveEngine::new());
+
+        Ok(Self {
+            log,
+            working,
+            semantic,
+            reactive,
+            clock,
+            base_path: base,
+        })
+    }
+
+    /// Advance the clock to `timestamp_ms`.
+    ///
+    /// For test clocks (e.g. [`MockClock`]) this moves time forward. For the
+    /// system clock it is a no-op.
+    #[doc(hidden)]
+    pub fn advance_clock_to(&self, timestamp_ms: u64) {
+        self.clock.advance_clock_to(timestamp_ms);
+    }
+
+    /// Append a new event to the log.
+    ///
+    /// Returns the engine-assigned global sequence number.
+    pub fn append(&self, input: EventInput) -> HiveResult<u64> {
+        let event = self.log.append(input)?;
+        self.reactive.dispatch(&event);
+        Ok(event.seq)
+    }
+
+    /// Read a single event by sequence number.
+    pub fn read(&self, seq: u64) -> HiveResult<Event> {
+        self.log.read(seq)
+    }
+
+    /// Query the current state of a projection.
+    pub fn project<P: Projection>(&self) -> HiveResult<P::State> {
+        self.log.project::<P>()
+    }
+
+    /// Returns the last sequence number applied to a projection.
+    pub fn projection_checkpoint<P: Projection>(&self) -> HiveResult<u64> {
+        self.log.projection_checkpoint::<P>()
+    }
+
+    /// Store a value in working memory with an optional TTL.
+    pub fn working_set(
+        &self,
+        agent_id: impl Into<AgentId>,
+        key: impl Into<String>,
+        value: Value,
+        ttl: Option<Duration>,
+    ) {
+        self.working.set(agent_id.into(), key.into(), value, ttl);
+    }
+
+    /// Retrieve a value from working memory, returning `None` if expired.
+    pub fn working_get(&self, agent_id: impl Into<AgentId>, key: &str) -> Option<Value> {
+        self.working.get(&agent_id.into(), key)
+    }
+
+    /// Return all non-expired keys for an agent.
+    pub fn working_keys(&self, agent_id: impl Into<AgentId>) -> Vec<String> {
+        self.working.keys(&agent_id.into())
+    }
+
+    /// Index a document for hybrid search.
+    pub fn index_doc(
+        &self,
+        id: impl Into<String>,
+        text: impl Into<String>,
+        vector: Vec<f32>,
+    ) -> HiveResult<()> {
+        self.index_doc_with(id, text, vector, &[])
+    }
+
+    /// Index a document with scalar filters for hybrid search.
+    pub fn index_doc_with(
+        &self,
+        id: impl Into<String>,
+        text: impl Into<String>,
+        vector: Vec<f32>,
+        filters: &[ScalarFilter],
+    ) -> HiveResult<()> {
+        let id = id.into();
+        let text = text.into();
+        match &self.semantic {
+            Some(semantic) => semantic
+                .index_doc(&id, &text, &vector, filters)
+                .map_err(Into::into),
+            None => Err(crate::error::HiveError::InvalidInput(
+                "semantic index not available in in-memory mode".into(),
+            )),
+        }
+    }
+
+    /// Execute a hybrid search query.
+    pub fn query_hybrid(&self, query: HybridQuery) -> HiveResult<Vec<Hit>> {
+        match &self.semantic {
+            Some(semantic) => semantic.query_hybrid(query).map_err(Into::into),
+            None => Err(crate::error::HiveError::InvalidInput(
+                "semantic index not available in in-memory mode".into(),
+            )),
+        }
+    }
+
+    /// Subscribe to a pattern of events.
+    pub fn subscribe(&self, pattern: EventPattern) -> Subscription {
+        self.reactive.subscribe(pattern)
+    }
+
+    /// Wipe all materialized projection state and rebuild it from the log.
+    #[doc(hidden)]
+    pub fn wipe_projections_and_rebuild(&self) -> HiveResult<()> {
+        self.log.wipe_projections_and_rebuild()
+    }
+
+    /// Number of events currently stored in the log.
+    pub fn log_len(&self) -> HiveResult<u64> {
+        self.log.len()
+    }
+
+    /// Read all events for a given agent/stream in ascending order.
+    pub fn read_stream(&self, agent_id: &AgentId, stream_id: &StreamId) -> HiveResult<Vec<Event>> {
+        self.log.read_stream(agent_id, stream_id)
+    }
+
+    /// Returns the base path of the database.
+    pub fn path(&self) -> &Path {
+        &self.base_path
+    }
+
+    /// Returns true if `agent` is authorized to perform `action` on `resource`
+    /// according to the current consent graph.
+    ///
+    /// This method appends an `IntentLogged` event to the log for audit
+    /// purposes. The returned `Decision` contains the sequence number of that
+    /// event and, if allowed, the grant that authorized it.
+    pub fn can(
+        &self,
+        agent: impl Into<AgentId>,
+        action: impl Into<String>,
+        resource: impl Into<String>,
+    ) -> HiveResult<Decision> {
+        let agent = agent.into();
+        let action = action.into();
+        let resource = resource.into();
+
+        let state = self.log.project::<ConsentGraph>()?;
+        let now = self.clock.now_ms();
+        let authorized_by = state.find_active_grant(&agent, &action, &resource, now);
+
+        let intent_seq = self.append(EventInput::new(
+            agent.clone(),
+            StreamId::from("consent"),
+            EventKind::IntentLogged {
+                actor: agent,
+                intent: format!("{}:{}", action, resource),
+                authorized_by,
+            },
+        ))?;
+
+        Ok(Decision {
+            allowed: authorized_by.is_some(),
+            intent_log_seq: Some(intent_seq),
+        })
+    }
+}
+
+/// Result of an authorization check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Decision {
+    allowed: bool,
+    intent_log_seq: Option<u64>,
+}
+
+impl Decision {
+    /// True if the action is authorized.
+    pub fn allowed(&self) -> bool {
+        self.allowed
+    }
+
+    /// Sequence number of the `IntentLogged` event recording this decision.
+    pub fn intent_log_seq(&self) -> Option<u64> {
+        self.intent_log_seq
+    }
+}
+
+fn default_registry() -> ProjectionRegistry {
+    let mut registry = ProjectionRegistry::empty();
+    registry.register::<CurrentFacts>();
+    registry.register::<TaskState>();
+    registry.register::<ConsentGraph>();
+    registry
+}
+
+impl From<hivedb_index::IndexError> for crate::error::HiveError {
+    fn from(e: hivedb_index::IndexError) -> Self {
+        crate::error::HiveError::InvalidInput(e.to_string())
+    }
+}

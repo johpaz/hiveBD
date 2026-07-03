@@ -1,0 +1,23 @@
+[package]
+name = "hivedb-index"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Índices semánticos de HiveDB: BM25 (tantivy), ANN (hnsw_rs) y fusión RRF."
+
+[dependencies]
+tantivy = { version = "0.21", default-features = false, features = ["mmap"] }
+hnsw_rs = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+bincode = { workspace = true }
+tempfile = "3"
+
+[[test]]
+name = "g4_semantic"
+path = "tests/g4_semantic.rs"

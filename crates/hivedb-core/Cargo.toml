@@ -1,0 +1,59 @@
+[package]
+name = "hivedb-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Núcleo Rust de HiveDB: event-log append-only, proyecciones y tiers de memoria."
+
+[dependencies]
+redb = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+bincode = { workspace = true }
+uuid = { workspace = true }
+dashmap = { workspace = true }
+tempfile = "3"
+hivedb-index = { path = "../hivedb-index" }
+tokio = { version = "1", features = ["sync"] }
+loom = "0.7"
+
+[dev-dependencies]
+proptest = "1"
+trybuild = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt", "time"] }
+
+[[test]]
+name = "g1_log"
+path = "tests/g1_log.rs"
+
+[[test]]
+name = "g2_projections"
+path = "tests/g2_projections.rs"
+
+[[test]]
+name = "g3_working"
+path = "tests/g3_working.rs"
+
+[[test]]
+name = "g4_semantic"
+path = "tests/g4_semantic.rs"
+
+[[test]]
+name = "g5_reactive"
+path = "tests/g5_reactive.rs"
+
+[[test]]
+name = "g6_consent"
+path = "tests/g6_consent.rs"
+
+[[test]]
+name = "g7_concurrency"
+path = "tests/g7_concurrency.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+*.proptest-regressions
+Cargo.lock
+*.node
+*.so
+node_modules/
+packages/hive-db/dist/
