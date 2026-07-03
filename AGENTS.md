@@ -4,10 +4,11 @@ Guía para agentes de código que trabajen en HiveDB.
 
 ## Contexto rápido
 
-HiveDB es un motor de base de datos embebido en Rust con dos crates:
+HiveDB es un motor de base de datos embebido en Rust con tres crates:
 
 - `crates/hivedb-core` — event-log, proyecciones, working memory, reactive engine, consent graph.
 - `crates/hivedb-index` — índice semántico híbrido (BM25 + ANN + RRF).
+- `crates/hivedb-napi` — binding napi-rs 3.x que expone `HiveDB` a Bun/Node.
 
 El log es **append-only e inmutable**. El motor asigna `seq` y `timestamp`. Las proyecciones se actualizan atómicamente dentro de la misma transacción `redb` (por shard desde G7).
 
@@ -66,6 +67,8 @@ crates/hivedb-core/tests/
   - Locales (`CurrentFacts`, `TaskState`): viven en cada shard; `project()` mergea estados parciales.
   - Globales (`ConsentGraph`): viven en `_global.redb`; implementar `Projection::scope() -> ProjectionScope::Global`.
 - **Concurrencia:** desde G7, cada `agent_id` escribe en su propio shard `redb`; el `seq` global es `AtomicU64`.
+- **Distribución (G9):** el binario nativo se construye y publica con `@napi-rs/cli` 3.x. Ver `docs/DISTRIBUTION.md` y `docs/IMPLEMENTATION.md` §13. Los scripts `napi` viven en `packages/hive-db/package.json`.
+- **napi-rs:** el crate `hivedb-napi` usa napi 3.10.1 con features `napi8`, `async`, `tokio_rt`. El runtime de tokio se captura en `open()` y se reutiliza en `subscribe()` (método sync que lanza `self.runtime.spawn`).
 
 ## Decisiones arquitectónicas vigentes
 
@@ -77,6 +80,7 @@ crates/hivedb-core/tests/
 ## Workarounds conocidos
 
 - `zstd-sys = 2.0.9` está fijado en `Cargo.lock` porque `zstd-safe 6.0.6` (traído por `tantivy 0.21`) falla con `zstd-sys 2.0.16`. No actualizar `zstd-sys` sin verificar `cargo test --workspace`.
+- `Cargo.lock` **está commiteado** (no en `.gitignore`) precisamente para preservar el fijado de `zstd-sys` en CI. No removerlo del repo.
 
 ## Puntos de extensión comunes
 

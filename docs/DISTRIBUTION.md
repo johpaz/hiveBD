@@ -91,7 +91,7 @@ git push --follow-tags
 Al detectar el tag `v*`, el workflow `.github/workflows/ci.yml` job `publish`:
 
 1. `napi create-npm-dirs` — regenera los subpaquetes `npm/<triple>/`.
-2. Descarga los binarios compilados en los 6 runners de la matriz.
+2. Descarga los binarios compilados en los runners de la matriz.
 3. `napi artifacts` — coloca cada `.node` en su subpaquete.
 4. Publica cada subpaquete: `npm publish ./npm/<triple> --access public`.
 5. Compila el TypeScript (`tsc`).

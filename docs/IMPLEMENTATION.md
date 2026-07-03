@@ -257,4 +257,69 @@ bun test
 2. Exponer working memory en el binding TS.
 3. Añadir persistencia de checkpoints de proyección más granular.
 4. Mejorar manejo de errores de callback en `ThreadsafeFunction`.
-5. Empaquetar `.node` multiplataforma con `@napi-rs/cli` en CI.
+
+---
+
+## 13. Distribución con `@napi-rs/cli`
+
+El binding nativo se construye, empaqueta y publica usando `@napi-rs/cli` 3.x. Ver `docs/DISTRIBUTION.md` para la guía completa.
+
+### Crates y versiones
+
+- `napi` 3.10.1 + `napi-derive` 3.5.9 + `napi-build` 2.x en `crates/hivedb-napi/Cargo.toml`.
+- `@napi-rs/cli` 3.7.2 en `packages/hive-db/package.json` (`devDependencies`).
+- El crate `hivedb-napi` requiere el feature `tokio_rt` de `napi` (adicional a `napi8` y `async`) porque `subscribe` usa `tokio::spawn`])
+
+### Configuración `napi` en `package.json`
+
+```jsonc
+"napi": {
+  "binaryName": "hivedb-napi",
+  "targets": [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc"
+  ]
+}
+```
+
+### Scripts del paquete
+
+| Script | Acción |
+|---|---|
+| `build:native` | `napi build --platform --release ...` + renombra `index.js` → `native.cjs` |
+| `build` | `build:native` + `tsc` |
+| `artifacts` | `napi artifacts` (coloca binarios en `npm/<triple>/`) |
+| `create-npm-dirs` | `napi create-npm-dirs` (genera subpaquetes `npm/`) |
+| `prepublishOnly` | `napi prepublish -t npm` + `tsc` |
+| `preversion` | `napi build --platform` + `git add .` |
+| `version` | `napi version` (sincroniza versión en subpaquetes) |
+
+### CI (`.github/workflows/ci.yml`)
+
+- **Job `lint-and-test`** (ubuntu): `cargo fmt`, `cargo clippy`, `cargo test`.
+- **Job `build`** (matrix de 6 targets): compila cada binario con `napi build --platform --release --target <triple>`. Musl usa `-x` (cargo-zigbuild + Zig). El runner de macOS x64 se hace cross-compile desde `macos-latest` (ARM) — no se usa `macos-13` (Intel) porque GitHub lo está retirando.
+- **Job `test-bun`** (ubuntu): descarga bindings linux-x64-gnu, compila TS, ejecuta `bun test`.
+- **Job `publish`** (solo en tag `v*`): `create-npm-dirs` → `download-artifact` → `napi artifacts` → `npm publish` por subpaquete → `tsc` → `npm publish` principal.
+
+### `.cargo/config.toml` (musl)
+
+```toml
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=-crt-static"]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=-crt-static"]
+```
+
+### Archivos generados (no commitear)
+
+- `packages/hive-db/native.cjs` — loader multiplataforma generado por `napi build --platform`.
+- `packages/hive-db/hivedb-napi.*.node` — binarios nativos por triple.
+- `packages/hive-db/npm/` — subpaquetes por plataforma (regenerados por `napi create-npm-dirs`).
+- `packages/hive-db/dist/` — salida de `tsc`.
+
+Todos están en `.gitignore`.
