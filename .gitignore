@@ -1,7 +1,6 @@
 /target
 **/*.rs.bk
 *.proptest-regressions
-Cargo.lock
 *.node
 *.so
 node_modules/
