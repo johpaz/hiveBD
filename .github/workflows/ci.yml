@@ -120,6 +120,7 @@ jobs:
 
       - name: Build native binding
         working-directory: packages/hive-db
+        shell: bash
         run: |
           bunx napi build --platform --release \
             --target ${{ matrix.target }} \
