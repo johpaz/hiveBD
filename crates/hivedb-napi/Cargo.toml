@@ -14,11 +14,11 @@ crate-type = ["cdylib"]
 [dependencies]
 hivedb-core = { path = "../hivedb-core" }
 hivedb-index = { path = "../hivedb-index" }
-napi = { version = "2.3", default-features = false, features = ["napi8", "async"] }
-napi-derive = "2.3"
+napi = { version = "3", default-features = false, features = ["napi8", "async", "tokio_rt"] }
+napi-derive = "3"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["sync", "rt", "macros"] }
 
 [build-dependencies]
-napi-build = "2.3"
+napi-build = "2"

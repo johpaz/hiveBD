@@ -6,3 +6,5 @@ Cargo.lock
 *.so
 node_modules/
 packages/hive-db/dist/
+packages/hive-db/native.cjs
+packages/hive-db/npm/

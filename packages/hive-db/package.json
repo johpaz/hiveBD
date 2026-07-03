@@ -29,25 +29,38 @@
   },
   "files": [
     "dist",
-    "src"
+    "src",
+    "native.cjs"
   ],
   "engines": {
     "node": ">=18"
   },
+  "napi": {
+    "binaryName": "hivedb-napi",
+    "targets": [
+      "x86_64-unknown-linux-gnu",
+      "x86_64-unknown-linux-musl",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-pc-windows-msvc"
+    ]
+  },
   "scripts": {
-    "build:napi": "cargo build -p hivedb-napi --release && cp ../../target/release/libhivedb_napi.so ./hivedb-napi.node",
-    "build": "tsc -p tsconfig.json",
-    "prepublishOnly": "bun run build",
+    "build:native": "napi build --platform --release --manifest-path ../../crates/hivedb-napi/Cargo.toml --output-dir . && mv index.js native.cjs && rm -f index.d.ts",
+    "build": "napi build --platform --release --manifest-path ../../crates/hivedb-napi/Cargo.toml --output-dir . && mv index.js native.cjs && rm -f index.d.ts && tsc -p tsconfig.json",
+    "artifacts": "napi artifacts",
+    "create-npm-dirs": "napi create-npm-dirs",
+    "prepublishOnly": "napi prepublish -t npm && tsc -p tsconfig.json",
+    "preversion": "napi build --platform --manifest-path ../../crates/hivedb-napi/Cargo.toml --output-dir . && mv index.js native.cjs && rm -f index.d.ts && git add .",
+    "version": "napi version",
     "test": "bun test"
   },
-  "optionalDependencies": {
-    "@johpaz/hive-db-linux-x64-gnu": "0.1.0",
-    "@johpaz/hive-db-linux-arm64-gnu": "0.1.0",
-    "@johpaz/hive-db-darwin-x64": "0.1.0",
-    "@johpaz/hive-db-darwin-arm64": "0.1.0",
-    "@johpaz/hive-db-win32-x64-msvc": "0.1.0"
+  "publishConfig": {
+    "access": "public"
   },
   "devDependencies": {
+    "@napi-rs/cli": "^3.7.2",
     "bun-types": "latest",
     "typescript": "^5"
   }

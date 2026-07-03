@@ -64,6 +64,7 @@ HiveDB modela el estado como un **event-log append-only inmutable** sobre el que
 - ✅ G6: Consent Graph (`can()`, `IntentLogged`, expiración controlada).
 - ✅ G7: Concurrencia particionada por `agent_id` + test `loom`.
 - ✅ G8: napi-rs binding + capa TypeScript (`@johpaz/hive-db`).
+- ✅ G9: Distribución multiplataforma con `@napi-rs/cli` (6 targets: linux x64 gnu/musl, linux arm64, macOS x64/arm64, Windows x64).
 
 ## Requisitos
 
@@ -97,8 +98,8 @@ RUSTFLAGS="--cfg loom" cargo test --test g7_concurrency no_data_race_on_seq_assi
 
 ```bash
 cd packages/hive-db
-bun run build:napi   # compila el binding nativo
-bun test             # §4.11 - §4.11d
+bun run build:native   # napi build --platform --release + renombra index.js -> native.cjs
+bun test               # §4.11 - §4.11d
 ```
 
 ## CI

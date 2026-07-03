@@ -1,47 +1,81 @@
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
+const { JsHiveDb } = require("../native.cjs") as {
+  JsHiveDb: {
+    open(path: string): Promise<JsHiveDbInner>;
+  };
+};
 
-/** Triple de plataforma usado para nombrar los paquetes de binarios nativos. */
-function platformTriple(): string {
-  const { platform, arch } = process;
-  switch (platform) {
-    case "linux":
-      return `linux-${arch}-gnu`;
-    case "darwin":
-      return `darwin-${arch}`;
-    case "win32":
-      return `win32-${arch}-msvc`;
-    default:
-      throw new Error(`@johpaz/hive-db: plataforma no soportada: ${platform}-${arch}`);
-  }
+interface JsHiveDbInner {
+  append(input: JsEventInput): Promise<number>;
+  read(seq: number): Promise<JsEvent>;
+  logLen(): Promise<number>;
+  projectTaskState(agentId: string, streamId: string): Promise<string | null>;
+  can(agent: string, action: string, resource: string): Promise<JsDecision>;
+  indexDoc(
+    id: string,
+    text: string,
+    vector: Float32Array,
+    filters?: JsScalarFilter[]
+  ): Promise<void>;
+  queryHybrid(query: JsHybridQuery): Promise<JsHit[]>;
+  subscribe(
+    pattern: JsEventPattern,
+    callback: (err: Error | null, event: JsEvent) => void
+  ): JsSubscriptionInner;
+  close(): void;
 }
 
-function loadNative(): any {
-  const errors: string[] = [];
-
-  // 1. Binario local de desarrollo (generado con `bun run build:napi`).
-  try {
-    return require("../hivedb-napi.node");
-  } catch (e: any) {
-    errors.push(String(e?.message ?? e));
-  }
-
-  // 2. Paquete de binarios instalado como optionalDependency desde npm.
-  try {
-    return require(`@johpaz/hive-db-${platformTriple()}`);
-  } catch (e: any) {
-    errors.push(String(e?.message ?? e));
-  }
-
-  throw new Error(
-    `@johpaz/hive-db: no se encontró el binario nativo para ${process.platform}-${process.arch}.\n` +
-      `Instala el paquete desde npm (incluye binarios por plataforma) o compílalo con "bun run build:napi".\n` +
-      `Detalles:\n- ${errors.join("\n- ")}`
-  );
+interface JsSubscriptionInner {
+  close(): void;
 }
 
-const addon = loadNative();
+interface JsEventInput {
+  agentId: string;
+  streamId: string;
+  kind: string;
+  payload: string;
+}
+
+interface JsEvent {
+  seq: number;
+  agentId: string;
+  streamId: string;
+  kindTag: string;
+  timestamp: number;
+  causation?: number;
+  correlation?: string;
+  payload: string;
+}
+
+interface JsDecision {
+  allowed: boolean;
+  intentLogSeq?: number;
+}
+
+interface JsScalarFilter {
+  field: string;
+  value: string;
+}
+
+interface JsHybridQuery {
+  text?: string;
+  vector?: Float32Array;
+  k: number;
+  filters?: JsScalarFilter[];
+}
+
+interface JsHit {
+  id: string;
+  score: number;
+}
+
+interface JsEventPattern {
+  agentId?: string;
+  kind?: string;
+  streamId?: string;
+}
 
 export interface EventInput {
   agentId: string;
@@ -94,14 +128,14 @@ export interface Subscription {
 }
 
 export class HiveDB {
-  private inner: any;
+  private inner: JsHiveDbInner;
 
-  private constructor(inner: any) {
+  private constructor(inner: JsHiveDbInner) {
     this.inner = inner;
   }
 
   static async open(path: string): Promise<HiveDB> {
-    return new HiveDB(await addon.JsHiveDb.open(path));
+    return new HiveDB(await JsHiveDb.open(path));
   }
 
   async append(input: EventInput): Promise<number> {
@@ -117,7 +151,7 @@ export class HiveDB {
   }
 
   async projectTaskState(agentId: string, streamId: string): Promise<string | undefined> {
-    return this.inner.projectTaskState(agentId, streamId);
+    return (await this.inner.projectTaskState(agentId, streamId)) ?? undefined;
   }
 
   async can(agent: string, action: string, resource: string): Promise<Decision> {
@@ -138,9 +172,7 @@ export class HiveDB {
   }
 
   subscribe(pattern: EventPattern, onEvent: (event: Event) => void): Subscription {
-    // The native binding invokes the callback as (err, event); hide the err
-    // channel so the public signature stays (event) => void.
-    return this.inner.subscribe(pattern, (_err: unknown, event: Event | null | undefined) => {
+    return this.inner.subscribe(pattern, (_err: Error | null, event: JsEvent | null | undefined) => {
       if (event != null) onEvent(event);
     });
   }
@@ -150,7 +182,7 @@ export class HiveDB {
     let resolveNext: ((result: IteratorResult<Event>) => void) | null = null;
     let closed = false;
 
-    const subscription = this.inner.subscribe(pattern, (_err: unknown, event: Event | null | undefined) => {
+    const subscription = this.inner.subscribe(pattern, (_err: Error | null, event: JsEvent | null | undefined) => {
       if (closed || event == null) return;
       if (resolveNext) {
         resolveNext({ value: event, done: false });
@@ -178,7 +210,6 @@ export class HiveDB {
       },
       close: () => {
         closed = true;
-        // Wake up any consumer blocked on next() so `for await` terminates.
         if (resolveNext) {
           resolveNext({ value: undefined, done: true } as IteratorResult<Event>);
           resolveNext = null;

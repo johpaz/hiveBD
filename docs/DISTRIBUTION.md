@@ -1,6 +1,6 @@
 # HiveDB — Guía de distribución
 
-> Cómo consumir `@johpaz/hive-db` hoy, y cómo publicarlo en npm con binarios para todos los sistemas operativos.
+> Cómo consumir `@johpaz/hive-db` y cómo publicarlo en npm con binarios para todos los sistemas operativos usando `@napi-rs/cli`.
 
 ---
 
@@ -34,25 +34,26 @@ En los tres casos necesitas el binario nativo compilado para **tu** máquina:
 
 ```bash
 cd packages/hive-db
-bun run build:napi   # requiere Rust instalado
+bun run build:native   # napi build --platform --release + renombra index.js -> native.cjs
 ```
 
 ---
 
 ## 2. Distribución multiplataforma (npm)
 
-La estrategia es la estándar de napi-rs: un paquete principal en TypeScript/JavaScript más **un paquete de binarios por plataforma** que npm/bun instala automáticamente según el SO gracias a los campos `os`/`cpu`/`libc`:
+La estrategia usa `@napi-rs/cli` 3.x: un paquete principal en TypeScript/JavaScript más **un paquete de binarios por plataforma** que npm/bun instala automáticamente según el SO gracias a los campos `os`/`cpu`/`libc`:
 
 | Paquete | Plataforma |
 |---|---|
 | `@johpaz/hive-db` | principal (TS/JS, sin binarios) |
 | `@johpaz/hive-db-linux-x64-gnu` | Linux x64 (glibc) |
+| `@johpaz/hive-db-linux-x64-musl` | Linux x64 (musl / Alpine) |
 | `@johpaz/hive-db-linux-arm64-gnu` | Linux arm64 (glibc) |
 | `@johpaz/hive-db-darwin-x64` | macOS Intel |
 | `@johpaz/hive-db-darwin-arm64` | macOS Apple Silicon |
 | `@johpaz/hive-db-win32-x64-msvc` | Windows x64 |
 
-El loader de `src/index.ts` primero busca el binario local de desarrollo (`hivedb-napi.node`) y, si no existe, carga el paquete de plataforma correspondiente.
+El loader `native.cjs` (generado por `napi build --platform`) detecta la plataforma en runtime —incluyendo la distinción glibc vs musl— y carga el binario correcto desde el subpaquete instalado o desde el archivo local de desarrollo.
 
 El consumidor final solo hace:
 
@@ -68,25 +69,33 @@ y recibe el binario correcto para su SO sin necesitar Rust.
 
 ### Requisitos (una sola vez)
 
-1. **Repo git en GitHub.** Este directorio aún no es un repo: `git init`, primer commit y push a `github.com/johpaz/hive-db` (o ajusta la URL en los `package.json` y `Cargo.toml`).
-2. **Cuenta npm con el scope `@johpaz`.** Los scopes de usuario ya funcionan; publica con `--access public` (el workflow ya lo hace).
+1. **Repo git en GitHub.** `git init`, primer commit y push a `github.com/johpaz/hive-db`.
+2. **Cuenta npm con el scope `@johpaz`.** Publica con `--access public` (el workflow ya lo hace).
 3. **Token npm** de tipo *Automation* → guardarlo como secret `NPM_TOKEN` en el repo de GitHub (Settings → Secrets → Actions).
 
-### Flujo de release
+### Flujo de release (local)
 
 ```bash
-# 1. Sube la versión en packages/hive-db/package.json y en los 5 npm/*/package.json
-#    (y las versiones de optionalDependencies del principal — deben coincidir).
-# 2. Etiqueta y push:
-git tag v0.1.0
-git push origin v0.1.0
+# 1. Subir la versión desde la raíz del paquete:
+cd packages/hive-db
+npm version patch   # o minor / major
+
+# Esto dispara los lifecycle scripts:
+#   preversion  → napi build --platform && git add .
+#   version     → napi version  (sincroniza subpaquetes npm/)
+#
+# 2. Push del tag:
+git push --follow-tags
 ```
 
-El workflow `.github/workflows/release.yml`:
+Al detectar el tag `v*`, el workflow `.github/workflows/ci.yml` job `publish`:
 
-1. Compila `hivedb-napi` en 5 runners (Ubuntu x64/arm64, macOS 13/latest, Windows) y renombra cada `cdylib` a `hivedb-napi.node`.
-2. Coloca cada binario en su subpaquete `npm/<plataforma>/` y lo publica.
-3. Compila el TypeScript (`dist/`) y publica el paquete principal.
+1. `napi create-npm-dirs` — regenera los subpaquetes `npm/<triple>/`.
+2. Descarga los binarios compilados en los 6 runners de la matriz.
+3. `napi artifacts` — coloca cada `.node` en su subpaquete.
+4. Publica cada subpaquete: `npm publish ./npm/<triple> --access public`.
+5. Compila el TypeScript (`tsc`).
+6. Publica el paquete principal: `npm publish --access public`.
 
 También puedes lanzarlo a mano desde la pestaña Actions (`workflow_dispatch`).
 
@@ -96,10 +105,11 @@ Solo publicarías el binario de tu plataforma — útil para probar el flujo, no
 
 ```bash
 cd packages/hive-db
-bun run build:napi
-cp hivedb-napi.node npm/linux-x64-gnu/
+bun run build:native
+cp hivedb-napi.linux-x64-gnu.node npm/linux-x64-gnu/
 npm publish ./npm/linux-x64-gnu --access public
-bun run build && npm publish --access public
+bun run tsc -p tsconfig.json
+npm publish --access public
 ```
 
 ---
@@ -114,7 +124,8 @@ bun run build && npm publish --access public
 
 ## 5. Plataformas no cubiertas (por ahora)
 
-- **Alpine/musl** (`linux-x64-musl`): añadir un target con `rust` + `musl-tools` en la matriz si despliegas en contenedores Alpine. Con imágenes Debian/Ubuntu no hace falta.
-- **Windows arm64**: añadir `aarch64-pc-windows-msvc` a la matriz cuando haya demanda.
+- **Windows arm64** (`win32-arm64-msvc`): añadir `aarch64-pc-windows-msvc` a `napi.targets` y a la matriz de CI.
+- **Linux arm64 musl** (`linux-arm64-musl`): añadir `aarch64-unknown-linux-musl` a `napi.targets` y a la matriz con `-x` (zigbuild). El `target-feature=-crt-static` ya está en `.cargo/config.toml`.
+- **Android**: `aarch64-linux-android` y `armv7-linux-androideabi` son soportados por `@napi-rs/cli`.
 
-Para añadir una plataforma: (1) nueva entrada en la matriz de `release.yml`, (2) nuevo subpaquete en `npm/`, (3) nueva `optionalDependency` en el paquete principal, (4) caso en `platformTriple()` de `src/index.ts` si el triple no sigue el patrón actual.
+Para añadir una plataforma: (1) nueva entrada en `napi.targets` del `package.json`, (2) nueva entrada en la matriz de `ci.yml`, (3) ejecutar `napi create-npm-dirs` para regenerar los subpaquetes.

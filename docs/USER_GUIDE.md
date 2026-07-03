@@ -12,15 +12,17 @@ Una vez publicado en npm (ver `docs/DISTRIBUTION.md`), desde cualquier proyecto 
 bun add @johpaz/hive-db   # instala el binario nativo de tu plataforma automáticamente
 ```
 
+Hay binarios para Linux x64 (glibc y musl/Alpine), Linux arm64, macOS x64 y arm64, y Windows x64.
+
 Para desarrollo dentro de este monorepo:
 
 ```bash
 # Dentro de un workspace Bun que ya tenga el paquete local
 bun install
 
-# Compila el binding nativo y genera hivedb-napi.node
+# Compila el binding nativo y genera native.cjs + hivedb-napi.<triple>.node
 cd packages/hive-db
-bun run build:napi
+bun run build:native
 ```
 
 Desde tu aplicación:

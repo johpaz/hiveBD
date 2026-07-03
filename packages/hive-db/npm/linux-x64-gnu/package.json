@@ -1,15 +1,39 @@
 {
   "name": "@johpaz/hive-db-linux-x64-gnu",
   "version": "0.1.0",
-  "description": "Binario nativo de HiveDB para Linux x64 (glibc).",
+  "cpu": [
+    "x64"
+  ],
+  "main": "hivedb-napi.linux-x64-gnu.node",
+  "files": [
+    "hivedb-napi.linux-x64-gnu.node"
+  ],
+  "description": "Motor de base de datos embebido, local-first y agent-native: event-log inmutable, proyecciones deterministas, búsqueda híbrida BM25+ANN y grafo de consentimiento.",
+  "keywords": [
+    "database",
+    "embedded",
+    "event-sourcing",
+    "agent",
+    "vector-search",
+    "bm25",
+    "local-first",
+    "napi-rs"
+  ],
   "license": "Apache-2.0",
+  "engines": {
+    "node": ">=18"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/johpaz/hive-db.git"
   },
-  "os": ["linux"],
-  "cpu": ["x64"],
-  "libc": ["glibc"],
-  "main": "hivedb-napi.node",
-  "files": ["hivedb-napi.node"]
+  "publishConfig": {
+    "access": "public"
+  },
+  "os": [
+    "linux"
+  ],
+  "libc": [
+    "glibc"
+  ]
 }

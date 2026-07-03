@@ -226,6 +226,7 @@ fn js_to_event_pattern(pattern: JsEventPattern) -> Result<EventPattern> {
 #[napi]
 pub struct JsHiveDB {
     inner: Mutex<Option<Arc<HiveDB>>>,
+    runtime: tokio::runtime::Handle,
 }
 
 impl JsHiveDB {
@@ -260,6 +261,7 @@ impl JsHiveDB {
         let db = HiveDB::open(path).map_err(js_err)?;
         Ok(Self {
             inner: Mutex::new(Some(Arc::new(db))),
+            runtime: tokio::runtime::Handle::current(),
         })
     }
 
@@ -345,7 +347,7 @@ impl JsHiveDB {
         let db = self.db_arc()?;
         let subscription = db.subscribe(pattern);
 
-        let handle = tokio::spawn(async move {
+        let handle = self.runtime.spawn(async move {
             let mut subscription = subscription;
             while let Some(event) = subscription.next().await {
                 let js_event = event_to_js(&event);

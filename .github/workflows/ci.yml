@@ -3,14 +3,21 @@ name: CI
 on:
   push:
     branches: [main]
+    tags:
+      - "v*"
   pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  rust:
+  lint-and-test:
+    name: Lint + Rust tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,7 +27,7 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Cache cargo registry
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
@@ -35,33 +42,206 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Run tests
+      - name: Run Rust tests
         run: cargo test --workspace
 
-  napi:
-    runs-on: ubuntu-latest
+  build:
+    name: Build ${{ matrix.triple }}
+    needs: lint-and-test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            triple: linux-x64-gnu
+            extra_flags: ""
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            triple: linux-x64-musl
+            extra_flags: "-x"
+            need_zig: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            triple: linux-arm64-gnu
+            extra_flags: ""
+          - os: macos-13
+            target: x86_64-apple-darwin
+            triple: darwin-x64
+            extra_flags: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            triple: darwin-arm64
+            extra_flags: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            triple: win32-x64-msvc
+            extra_flags: ""
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          targets: ${{ matrix.target }}
 
-      - name: Cache cargo registry
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.triple }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build napi binding
-        run: cd packages/hive-db && bun run build:napi
+      - name: Setup Zig
+        if: ${{ matrix.need_zig }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: Install cargo-zigbuild
+        if: ${{ matrix.need_zig }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        working-directory: packages/hive-db
+        run: bun install
+
+      - name: Build native binding
+        working-directory: packages/hive-db
+        run: |
+          bunx napi build --platform --release \
+            --target ${{ matrix.target }} \
+            --manifest-path ../../crates/hivedb-napi/Cargo.toml \
+            --output-dir . ${{ matrix.extra_flags }}
+
+      - name: Move JS binding
+        working-directory: packages/hive-db
+        shell: bash
+        run: mv index.js native.cjs 2>/dev/null; rm -f index.d.ts; true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.triple }}
+          path: |
+            packages/hive-db/hivedb-napi.*.node
+            packages/hive-db/native.cjs
+          if-no-files-found: error
+
+  test-bun:
+    name: Bun tests
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-x64-gnu-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install dependencies
+        working-directory: packages/hive-db
+        run: bun install
+
+      - name: Download linux-x64-gnu bindings
+        uses: actions/download-artifact@v4
+        with:
+          name: bindings-linux-x64-gnu
+          path: packages/hive-db/
+
+      - name: Build TypeScript
+        working-directory: packages/hive-db
+        run: bun run tsc -p tsconfig.json
 
       - name: Run Bun tests
-        run: cd packages/hive-db && bun test
+        working-directory: packages/hive-db
+        run: bun test
+
+  publish:
+    name: Publish to npm
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint-and-test, build, test-bun]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        working-directory: packages/hive-db
+        run: bun install
+
+      - name: Create npm dirs
+        working-directory: packages/hive-db
+        run: bunx napi create-npm-dirs
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: packages/hive-db/artifacts
+
+      - name: Move artifacts into npm dirs
+        working-directory: packages/hive-db
+        run: bunx napi artifacts
+
+      - name: Copy native loader to package root
+        working-directory: packages/hive-db
+        shell: bash
+        run: cp artifacts/bindings-linux-x64-gnu/native.cjs ./native.cjs
+
+      - name: List npm dirs
+        working-directory: packages/hive-db
+        shell: bash
+        run: ls -R ./npm
+
+      - name: Publish platform packages
+        working-directory: packages/hive-db
+        run: |
+          for triple in linux-x64-gnu linux-x64-musl linux-arm64-gnu darwin-x64 darwin-arm64 win32-x64-msvc; do
+            npm publish "./npm/${triple}" --access public
+          done
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Build TypeScript
+        working-directory: packages/hive-db
+        run: bun run tsc -p tsconfig.json
+
+      - name: Publish main package
+        working-directory: packages/hive-db
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
