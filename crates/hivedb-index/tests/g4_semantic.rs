@@ -222,8 +222,7 @@ fn malformed_query_never_fails() {
         "field:value*^~",
         "***",
     ] {
-        let result =
-            index.query_hybrid(HybridQuery::default().with_text(query).with_k(5));
+        let result = index.query_hybrid(HybridQuery::default().with_text(query).with_k(5));
         assert!(result.is_ok(), "query {query:?} must not fail");
     }
 
@@ -326,7 +325,10 @@ fn delete_removes_text_and_vector() {
     let hits = index
         .query_hybrid(HybridQuery::default().with_vector(embed("pago")).with_k(5))
         .unwrap();
-    assert!(hits.iter().all(|h| h.id != "d1"), "vector must be tombstoned");
+    assert!(
+        hits.iter().all(|h| h.id != "d1"),
+        "vector must be tombstoned"
+    );
 
     // Deletion survives a reopen (tombstone is persisted).
     drop(index);
@@ -363,7 +365,11 @@ fn delete_by_filter_removes_matching_docs() {
         .unwrap();
 
     let hits = index
-        .query_hybrid(HybridQuery::default().with_text("herramienta servidor").with_k(10))
+        .query_hybrid(
+            HybridQuery::default()
+                .with_text("herramienta servidor")
+                .with_k(10),
+        )
         .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].id, "srv-b-0");
@@ -410,7 +416,12 @@ fn batch_upsert_indexes_all_docs() {
     let index = SemanticIndex::open(dir.path(), 384).unwrap();
 
     let docs: Vec<IndexDoc> = (0..50)
-        .map(|i| doc(&format!("d{i}"), &format!("documento número {i} sobre pagos")))
+        .map(|i| {
+            doc(
+                &format!("d{i}"),
+                &format!("documento número {i} sobre pagos"),
+            )
+        })
         .collect();
     index.upsert_batch(&docs).unwrap();
 
@@ -427,7 +438,9 @@ fn text_only_docs_coexist_with_vector_queries() {
     let dir = tempfile::tempdir().unwrap();
     let index = SemanticIndex::open(dir.path(), 384).unwrap();
 
-    index.upsert(&doc("text-only", "solo texto sin vector")).unwrap();
+    index
+        .upsert(&doc("text-only", "solo texto sin vector"))
+        .unwrap();
     index
         .upsert(&doc("with-vec", "documento con vector").with_vector(embed("pago")))
         .unwrap();
@@ -441,7 +454,11 @@ fn text_only_docs_coexist_with_vector_queries() {
 
     // Text query sees both.
     let hits = index
-        .query_hybrid(HybridQuery::default().with_text("texto vector documento").with_k(10))
+        .query_hybrid(
+            HybridQuery::default()
+                .with_text("texto vector documento")
+                .with_k(10),
+        )
         .unwrap();
     assert_eq!(hits.len(), 2);
 }
@@ -493,14 +510,22 @@ fn single_source_scores_are_raw() {
     let hits = index
         .query_hybrid(HybridQuery::default().with_text("pago fallido").with_k(1))
         .unwrap();
-    assert!(hits[0].score > 0.1, "expected raw BM25, got {}", hits[0].score);
+    assert!(
+        hits[0].score > 0.1,
+        "expected raw BM25, got {}",
+        hits[0].score
+    );
     assert_eq!(hits[0].text_score, Some(hits[0].score));
 
     // Vector-only: cosine similarity of identical vectors ≈ 1.0.
     let hits = index
         .query_hybrid(HybridQuery::default().with_vector(embed("pago")).with_k(1))
         .unwrap();
-    assert!(hits[0].score > 0.99, "expected cosine ≈ 1, got {}", hits[0].score);
+    assert!(
+        hits[0].score > 0.99,
+        "expected cosine ≈ 1, got {}",
+        hits[0].score
+    );
     assert_eq!(hits[0].vector_score, Some(hits[0].score));
 }
 

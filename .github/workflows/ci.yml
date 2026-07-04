@@ -248,11 +248,12 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_name }}
           generate_release_notes: true
           files: |
             packages/hive-db/npm/**/*.node
-        env:
+          env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

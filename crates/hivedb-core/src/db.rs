@@ -339,7 +339,9 @@ impl HiveDB {
 
     /// Delete every indexed document carrying the given scalar filter.
     pub fn delete_by_filter(&self, filter: &ScalarFilter) -> HiveResult<()> {
-        self.semantic()?.delete_by_filter(filter).map_err(Into::into)
+        self.semantic()?
+            .delete_by_filter(filter)
+            .map_err(Into::into)
     }
 
     /// Remove every document from the semantic index.
