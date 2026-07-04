@@ -1,5 +1,7 @@
-use hivedb_core::{AgentId, Decision, EventInput, EventKind, EventPattern, HiveDB, StreamId};
-use hivedb_index::{Fusion, Hit as CoreHit, HybridQuery, ScalarFilter};
+use hivedb_core::{
+    AgentId, Decision, EventInput, EventKind, EventPattern, HiveDB, OpenOptions, StreamId,
+};
+use hivedb_index::{FieldBoosts, Fusion, Hit as CoreHit, HybridQuery, IndexDoc, ScalarFilter};
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::*;
@@ -40,17 +42,53 @@ pub struct JsScalarFilter {
 }
 
 #[napi(object)]
+pub struct JsFusion {
+    /// Fusion strategy. Only `"rrf"` is supported.
+    pub kind: String,
+    /// RRF `k` parameter (default 60).
+    pub k: Option<u32>,
+}
+
+#[napi(object)]
+pub struct JsFieldBoosts {
+    pub name: Option<f64>,
+    pub body: Option<f64>,
+    pub tags: Option<f64>,
+}
+
+#[napi(object)]
 pub struct JsHybridQuery {
     pub text: Option<String>,
     pub vector: Option<Float32Array>,
     pub k: u32,
     pub filters: Option<Vec<JsScalarFilter>>,
+    pub fusion: Option<JsFusion>,
+    pub boosts: Option<JsFieldBoosts>,
 }
 
 #[napi(object)]
 pub struct JsHit {
     pub id: String,
     pub score: f64,
+    pub text_score: Option<f64>,
+    pub vector_score: Option<f64>,
+}
+
+#[napi(object)]
+pub struct JsIndexDoc {
+    pub id: String,
+    pub name: Option<String>,
+    pub body: Option<String>,
+    pub tags: Option<String>,
+    pub vector: Option<Float32Array>,
+    pub filters: Option<Vec<JsScalarFilter>>,
+}
+
+#[napi(object)]
+pub struct JsOpenOptions {
+    /// Dimension of vectors accepted by the semantic index (default 384).
+    /// Fixed at first open; reopening with a different value is an error.
+    pub vector_dimension: Option<u32>,
 }
 
 #[napi(object)]
@@ -177,19 +215,60 @@ fn js_to_hybrid_query(query: JsHybridQuery) -> Result<HybridQuery> {
         .filters
         .map(|fs| fs.into_iter().map(js_to_scalar_filter).collect())
         .unwrap_or_default();
+
+    let fusion = match query.fusion {
+        Some(fusion) => match fusion.kind.as_str() {
+            "rrf" => Fusion::Rrf {
+                k: fusion.k.unwrap_or(60) as usize,
+            },
+            other => {
+                return Err(Error::from_reason(format!(
+                    "unknown fusion kind: {other} (only \"rrf\" is supported)"
+                )));
+            }
+        },
+        None => Fusion::default(),
+    };
+
+    let boosts = query.boosts.map(|b| {
+        let defaults = FieldBoosts::default();
+        FieldBoosts {
+            name: b.name.map(|v| v as f32).unwrap_or(defaults.name),
+            body: b.body.map(|v| v as f32).unwrap_or(defaults.body),
+            tags: b.tags.map(|v| v as f32).unwrap_or(defaults.tags),
+        }
+    });
+
     Ok(HybridQuery {
         text,
         vector,
         k: query.k as usize,
         filters,
-        fusion: Fusion::Rrf { k: 60 },
+        fusion,
+        boosts,
     })
+}
+
+fn js_to_index_doc(doc: JsIndexDoc) -> IndexDoc {
+    IndexDoc {
+        id: doc.id,
+        name: doc.name,
+        body: doc.body,
+        tags: doc.tags,
+        vector: doc.vector.map(|v| v.to_vec()),
+        filters: doc
+            .filters
+            .map(|fs| fs.into_iter().map(js_to_scalar_filter).collect())
+            .unwrap_or_default(),
+    }
 }
 
 fn hit_to_js(hit: CoreHit) -> JsHit {
     JsHit {
         id: hit.id,
         score: hit.score as f64,
+        text_score: hit.text_score.map(|s| s as f64),
+        vector_score: hit.vector_score.map(|s| s as f64),
     }
 }
 
@@ -257,8 +336,20 @@ impl JsHiveDB {
 #[napi]
 impl JsHiveDB {
     #[napi(factory)]
-    pub async fn open(path: String) -> Result<Self> {
-        let db = HiveDB::open(path).map_err(js_err)?;
+    pub async fn open(path: String, options: Option<JsOpenOptions>) -> Result<Self> {
+        let open_options = OpenOptions {
+            vector_dimension: options
+                .and_then(|o| o.vector_dimension)
+                .map(|d| d as usize)
+                .unwrap_or(OpenOptions::default().vector_dimension),
+        };
+        // ":memory:" opens an ephemeral database backed by a process-lifetime
+        // temporary directory, so tests never touch persistent storage.
+        let db = if path == ":memory:" {
+            HiveDB::open_temp_with_options(open_options).map_err(js_err)?
+        } else {
+            HiveDB::open_with_options(path, open_options).map_err(js_err)?
+        };
         Ok(Self {
             inner: Mutex::new(Some(Arc::new(db))),
             runtime: tokio::runtime::Handle::current(),
@@ -310,6 +401,8 @@ impl JsHiveDB {
         })
     }
 
+    /// Deprecated: use `upsertDoc`. Kept for one version; `text` maps to the
+    /// `body` field.
     #[napi]
     pub async fn index_doc(
         &self,
@@ -326,6 +419,40 @@ impl JsHiveDB {
             db.index_doc_with(id, text, vector, &filters)
                 .map_err(js_err)
         })
+    }
+
+    /// Insert or replace a document in the semantic index.
+    #[napi]
+    pub async fn upsert_doc(&self, doc: JsIndexDoc) -> Result<()> {
+        let doc = js_to_index_doc(doc);
+        self.with_db(|db| db.upsert_doc(&doc).map_err(js_err))
+    }
+
+    /// Insert or replace a batch of documents under a single text-index
+    /// commit. Much faster than repeated `upsertDoc` calls.
+    #[napi]
+    pub async fn upsert_batch(&self, docs: Vec<JsIndexDoc>) -> Result<()> {
+        let docs: Vec<IndexDoc> = docs.into_iter().map(js_to_index_doc).collect();
+        self.with_db(|db| db.upsert_batch(&docs).map_err(js_err))
+    }
+
+    /// Delete a document from the semantic index. Missing ids are a no-op.
+    #[napi]
+    pub async fn delete_doc(&self, id: String) -> Result<()> {
+        self.with_db(|db| db.delete_doc(&id).map_err(js_err))
+    }
+
+    /// Delete every indexed document carrying the given scalar filter.
+    #[napi]
+    pub async fn delete_by_filter(&self, filter: JsScalarFilter) -> Result<()> {
+        let filter = js_to_scalar_filter(filter);
+        self.with_db(|db| db.delete_by_filter(&filter).map_err(js_err))
+    }
+
+    /// Remove every document from the semantic index.
+    #[napi]
+    pub async fn clear_index(&self) -> Result<()> {
+        self.with_db(|db| db.clear_index().map_err(js_err))
     }
 
     #[napi]

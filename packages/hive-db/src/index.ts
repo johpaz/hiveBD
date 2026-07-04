@@ -3,7 +3,7 @@ import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const { JsHiveDb } = require("../native.cjs") as {
   JsHiveDb: {
-    open(path: string): Promise<JsHiveDbInner>;
+    open(path: string, options?: JsOpenOptions): Promise<JsHiveDbInner>;
   };
 };
 
@@ -19,12 +19,30 @@ interface JsHiveDbInner {
     vector: Float32Array,
     filters?: JsScalarFilter[]
   ): Promise<void>;
+  upsertDoc(doc: JsIndexDoc): Promise<void>;
+  upsertBatch(docs: JsIndexDoc[]): Promise<void>;
+  deleteDoc(id: string): Promise<void>;
+  deleteByFilter(filter: JsScalarFilter): Promise<void>;
+  clearIndex(): Promise<void>;
   queryHybrid(query: JsHybridQuery): Promise<JsHit[]>;
   subscribe(
     pattern: JsEventPattern,
     callback: (err: Error | null, event: JsEvent) => void
   ): JsSubscriptionInner;
   close(): void;
+}
+
+interface JsOpenOptions {
+  vectorDimension?: number;
+}
+
+interface JsIndexDoc {
+  id: string;
+  name?: string;
+  body?: string;
+  tags?: string;
+  vector?: Float32Array;
+  filters?: JsScalarFilter[];
 }
 
 interface JsSubscriptionInner {
@@ -64,11 +82,26 @@ interface JsHybridQuery {
   vector?: Float32Array;
   k: number;
   filters?: JsScalarFilter[];
+  fusion?: JsFusion;
+  boosts?: JsFieldBoosts;
+}
+
+interface JsFusion {
+  kind: string;
+  k?: number;
+}
+
+interface JsFieldBoosts {
+  name?: number;
+  body?: number;
+  tags?: number;
 }
 
 interface JsHit {
   id: string;
   score: number;
+  textScore?: number;
+  vectorScore?: number;
 }
 
 interface JsEventPattern {
@@ -105,16 +138,66 @@ export interface ScalarFilter {
   value: string;
 }
 
+export interface OpenOptions {
+  /**
+   * Dimension of vectors accepted by the semantic index (default 384).
+   * Fixed at first open; reopening with a different value is an error.
+   */
+  vectorDimension?: number;
+}
+
+/**
+ * A document for the semantic index. All text slots are optional; a document
+ * without a vector never touches the vector index.
+ */
+export interface IndexDoc {
+  id: string;
+  /** Short, high-signal title (boosted highest by default). */
+  name?: string;
+  /** Main text content. */
+  body?: string;
+  /** Categories, triggers, keywords. */
+  tags?: string;
+  /** Optional embedding; must match the index dimension when present. */
+  vector?: Float32Array;
+  filters?: ScalarFilter[];
+}
+
+/** Fusion strategy, used only when both text and vector are present. */
+export interface Fusion {
+  kind: "rrf";
+  /** RRF `k` parameter (default 60). */
+  k?: number;
+}
+
+/** Per-field BM25 boosts (defaults: name 4.0, body 2.0, tags 3.0). */
+export interface FieldBoosts {
+  name?: number;
+  body?: number;
+  tags?: number;
+}
+
 export interface HybridQuery {
+  /** Parsed leniently: raw user input (quotes, operators) never throws. */
   text?: string;
   vector?: Float32Array;
   k: number;
   filters?: ScalarFilter[];
+  fusion?: Fusion;
+  boosts?: FieldBoosts;
 }
 
+/**
+ * Score semantics: text-only queries return raw BM25 (positive, higher is
+ * better), vector-only queries return cosine similarity, hybrid queries
+ * return RRF-fused scores with the raw components in `textScore` /
+ * `vectorScore`.
+ */
 export interface Hit {
   id: string;
   score: number;
+  textScore?: number;
+  vectorScore?: number;
 }
 
 export interface EventPattern {
@@ -134,8 +217,12 @@ export class HiveDB {
     this.inner = inner;
   }
 
-  static async open(path: string): Promise<HiveDB> {
-    return new HiveDB(await JsHiveDb.open(path));
+  /**
+   * Open (or create) a database at `path`. Pass `":memory:"` for an
+   * ephemeral database that never touches persistent storage.
+   */
+  static async open(path: string, options?: OpenOptions): Promise<HiveDB> {
+    return new HiveDB(await JsHiveDb.open(path, options));
   }
 
   async append(input: EventInput): Promise<number> {
@@ -158,6 +245,7 @@ export class HiveDB {
     return this.inner.can(agent, action, resource);
   }
 
+  /** @deprecated Use {@link upsertDoc}; `text` maps to the `body` field. */
   async indexDoc(
     id: string,
     text: string,
@@ -165,6 +253,34 @@ export class HiveDB {
     filters?: ScalarFilter[]
   ): Promise<void> {
     return this.inner.indexDoc(id, text, vector, filters);
+  }
+
+  /** Insert or replace a document in the semantic index. */
+  async upsertDoc(doc: IndexDoc): Promise<void> {
+    return this.inner.upsertDoc(doc);
+  }
+
+  /**
+   * Insert or replace a batch of documents under a single index commit.
+   * Much faster than repeated `upsertDoc` calls.
+   */
+  async upsertBatch(docs: IndexDoc[]): Promise<void> {
+    return this.inner.upsertBatch(docs);
+  }
+
+  /** Delete a document from the semantic index. Missing ids are a no-op. */
+  async deleteDoc(id: string): Promise<void> {
+    return this.inner.deleteDoc(id);
+  }
+
+  /** Delete every indexed document carrying the given scalar filter. */
+  async deleteByFilter(filter: ScalarFilter): Promise<void> {
+    return this.inner.deleteByFilter(filter);
+  }
+
+  /** Remove every document from the semantic index. */
+  async clearIndex(): Promise<void> {
+    return this.inner.clearIndex();
   }
 
   async queryHybrid(query: HybridQuery): Promise<Hit[]> {

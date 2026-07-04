@@ -10,13 +10,63 @@ use crate::reactive::{EventPattern, ReactiveEngine, Subscription};
 use crate::state::{
     consent_graph::ConsentGraph, current_facts::CurrentFacts, task_state::TaskState,
 };
-use hivedb_index::{Hit, HybridQuery, ScalarFilter, SemanticIndex};
+use hivedb_index::{Hit, HybridQuery, IndexDoc, ScalarFilter, SemanticIndex};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-const VECTOR_DIMENSION: usize = 384;
+const DEFAULT_VECTOR_DIMENSION: usize = 384;
+
+/// File under the base directory recording immutable per-database settings.
+const META_FILE: &str = "meta.json";
+
+/// Options for opening a database.
+#[derive(Clone, Copy, Debug)]
+pub struct OpenOptions {
+    /// Dimension of vectors accepted by the semantic index. Fixed at first
+    /// open; reopening with a different value is an error.
+    pub vector_dimension: usize,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self {
+            vector_dimension: DEFAULT_VECTOR_DIMENSION,
+        }
+    }
+}
+
+/// Load the persisted vector dimension, or persist `requested` on first open.
+/// Returns an error if the database was created with a different dimension.
+fn resolve_vector_dimension(base: &Path, requested: usize) -> HiveResult<usize> {
+    let meta_path = base.join(META_FILE);
+    if meta_path.exists() {
+        let raw = std::fs::read_to_string(&meta_path)?;
+        let meta: Value = serde_json::from_str(&raw).map_err(|e| {
+            crate::error::HiveError::InvalidInput(format!("corrupt {META_FILE}: {e}"))
+        })?;
+        let stored = meta
+            .get("vector_dimension")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                crate::error::HiveError::InvalidInput(format!(
+                    "corrupt {META_FILE}: missing vector_dimension"
+                ))
+            })? as usize;
+        if stored != requested {
+            return Err(crate::error::HiveError::InvalidInput(format!(
+                "database was created with vector_dimension={stored}, \
+                 cannot reopen with vector_dimension={requested}"
+            )));
+        }
+        Ok(stored)
+    } else {
+        let meta = serde_json::json!({ "vector_dimension": requested });
+        std::fs::write(&meta_path, meta.to_string())?;
+        Ok(requested)
+    }
+}
 
 /// Public handle to a HiveDB database.
 ///
@@ -102,19 +152,36 @@ impl LogHandle {
 impl HiveDB {
     /// Open a database at the given path, creating it if necessary.
     pub fn open<P: AsRef<Path>>(path: P) -> HiveResult<Self> {
-        Self::open_with_clock(path, into_clock(SystemClock))
+        Self::open_with_options(path, OpenOptions::default())
+    }
+
+    /// Open a database with explicit options.
+    pub fn open_with_options<P: AsRef<Path>>(path: P, options: OpenOptions) -> HiveResult<Self> {
+        Self::open_with_clock_and_options(path, into_clock(SystemClock), options)
     }
 
     /// Open a database with an explicit clock source.
     #[doc(hidden)]
     pub fn open_with_clock<P: AsRef<Path>>(path: P, clock: Arc<dyn Clock>) -> HiveResult<Self> {
+        Self::open_with_clock_and_options(path, clock, OpenOptions::default())
+    }
+
+    /// Open a database with an explicit clock source and options.
+    #[doc(hidden)]
+    pub fn open_with_clock_and_options<P: AsRef<Path>>(
+        path: P,
+        clock: Arc<dyn Clock>,
+        options: OpenOptions,
+    ) -> HiveResult<Self> {
         let base = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&base)?;
+
+        let dimension = resolve_vector_dimension(&base, options.vector_dimension)?;
 
         let registry = default_registry();
         let log = LogHandle::Redb(Arc::new(EventLog::open(&base, registry, clock.clone())?));
         let working = Arc::new(WorkingMemory::new());
-        let semantic = Some(Arc::new(SemanticIndex::open(&base, VECTOR_DIMENSION)?));
+        let semantic = Some(Arc::new(SemanticIndex::open(&base, dimension)?));
         let reactive = Arc::new(ReactiveEngine::new());
 
         Ok(Self {
@@ -170,25 +237,26 @@ impl HiveDB {
     /// Open a temporary database with an explicit clock source.
     #[doc(hidden)]
     pub fn open_temp_with_clock(clock: Arc<dyn Clock>) -> HiveResult<Self> {
+        Self::open_temp_with_clock_and_options(clock, OpenOptions::default())
+    }
+
+    /// Open a temporary database with an explicit clock source and options.
+    #[doc(hidden)]
+    pub fn open_temp_with_clock_and_options(
+        clock: Arc<dyn Clock>,
+        options: OpenOptions,
+    ) -> HiveResult<Self> {
         let dir = tempfile::tempdir()?;
         let base = dir.path().to_path_buf();
         // Leak the TempDir so the files stay alive for the lifetime of the process.
         let _ = Box::leak(Box::new(dir));
 
-        let registry = default_registry();
-        let log = LogHandle::Redb(Arc::new(EventLog::open(&base, registry, clock.clone())?));
-        let working = Arc::new(WorkingMemory::new());
-        let semantic = Some(Arc::new(SemanticIndex::open(&base, VECTOR_DIMENSION)?));
-        let reactive = Arc::new(ReactiveEngine::new());
+        Self::open_with_clock_and_options(base, clock, options)
+    }
 
-        Ok(Self {
-            log,
-            working,
-            semantic,
-            reactive,
-            clock,
-            base_path: base,
-        })
+    /// Open a temporary database with explicit options.
+    pub fn open_temp_with_options(options: OpenOptions) -> HiveResult<Self> {
+        Self::open_temp_with_clock_and_options(into_clock(SystemClock), options)
     }
 
     /// Advance the clock to `timestamp_ms`.
@@ -245,7 +313,44 @@ impl HiveDB {
         self.working.keys(&agent_id.into())
     }
 
+    fn semantic(&self) -> HiveResult<&SemanticIndex> {
+        self.semantic.as_deref().ok_or_else(|| {
+            crate::error::HiveError::InvalidInput(
+                "semantic index not available in in-memory mode".into(),
+            )
+        })
+    }
+
+    /// Insert or replace a document in the semantic index.
+    pub fn upsert_doc(&self, doc: &IndexDoc) -> HiveResult<()> {
+        self.semantic()?.upsert(doc).map_err(Into::into)
+    }
+
+    /// Insert or replace a batch of documents under a single text-index
+    /// commit.
+    pub fn upsert_batch(&self, docs: &[IndexDoc]) -> HiveResult<()> {
+        self.semantic()?.upsert_batch(docs).map_err(Into::into)
+    }
+
+    /// Delete a document from the semantic index. Missing ids are a no-op.
+    pub fn delete_doc(&self, id: &str) -> HiveResult<()> {
+        self.semantic()?.delete(id).map_err(Into::into)
+    }
+
+    /// Delete every indexed document carrying the given scalar filter.
+    pub fn delete_by_filter(&self, filter: &ScalarFilter) -> HiveResult<()> {
+        self.semantic()?.delete_by_filter(filter).map_err(Into::into)
+    }
+
+    /// Remove every document from the semantic index.
+    pub fn clear_index(&self) -> HiveResult<()> {
+        self.semantic()?.clear().map_err(Into::into)
+    }
+
     /// Index a document for hybrid search.
+    ///
+    /// Deprecated shim over [`HiveDB::upsert_doc`]: `text` maps to the `body`
+    /// field.
     pub fn index_doc(
         &self,
         id: impl Into<String>,
@@ -256,6 +361,9 @@ impl HiveDB {
     }
 
     /// Index a document with scalar filters for hybrid search.
+    ///
+    /// Deprecated shim over [`HiveDB::upsert_doc`]: `text` maps to the `body`
+    /// field.
     pub fn index_doc_with(
         &self,
         id: impl Into<String>,
@@ -263,26 +371,16 @@ impl HiveDB {
         vector: Vec<f32>,
         filters: &[ScalarFilter],
     ) -> HiveResult<()> {
-        let id = id.into();
-        let text = text.into();
-        match &self.semantic {
-            Some(semantic) => semantic
-                .index_doc(&id, &text, &vector, filters)
-                .map_err(Into::into),
-            None => Err(crate::error::HiveError::InvalidInput(
-                "semantic index not available in in-memory mode".into(),
-            )),
-        }
+        let doc = IndexDoc::new(id)
+            .with_body(text)
+            .with_vector(vector)
+            .with_filters(filters.to_vec());
+        self.upsert_doc(&doc)
     }
 
     /// Execute a hybrid search query.
     pub fn query_hybrid(&self, query: HybridQuery) -> HiveResult<Vec<Hit>> {
-        match &self.semantic {
-            Some(semantic) => semantic.query_hybrid(query).map_err(Into::into),
-            None => Err(crate::error::HiveError::InvalidInput(
-                "semantic index not available in in-memory mode".into(),
-            )),
-        }
+        self.semantic()?.query_hybrid(query).map_err(Into::into)
     }
 
     /// Subscribe to a pattern of events.

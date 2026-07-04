@@ -172,11 +172,12 @@ Tres tiers físicamente distintos, cada uno optimizado para su patrón de acceso
 
 ```rust
 struct HybridQuery {
-    text:   Option<String>,   // → tantivy BM25
+    text:   Option<String>,   // → tantivy BM25 (parsing tolerante, analyzer español)
     vector: Option<Vec<f32>>, // → hnsw_rs ANN
-    filters: Vec<ScalarFilter>, // empujados al índice
+    filters: Vec<ScalarFilter>, // aplicados a texto y vector
     k: usize,
-    fusion: Fusion,           // RRF (default) | WeightedSum
+    fusion: Fusion,           // RRF { k } — solo aplica en modo híbrido
+    boosts: Option<FieldBoosts>, // pesos por campo: name/body/tags
 }
 ```
 
@@ -254,19 +255,19 @@ const seq = await db.append({
   payload: { ... },
 });
 
-// Proyección / estado actual
-const state = await db.project("TaskState", task.id);
+// Proyección / estado actual (hoy: projectTaskState; project genérico es roadmap)
+const state = await db.projectTaskState(agentId, task.id);
 
 // Búsqueda híbrida nativa (texto + vector + filtros, fusión RRF)
 const hits = await db.queryHybrid({
   text: "error de compilación en el módulo de pagos",
   vector: embedding,
-  filters: [{ field: "agentId", eq: "BackendEngineer" }],
+  filters: [{ field: "agentId", value: "BackendEngineer" }],
   k: 10,
 });
 
 // Suscripción reactiva (push, no polling)
-for await (const ev of db.subscribe({ kind: "ToolCall" })) {
+for await (const ev of db.events({ kind: "ToolCall" })) {
   // despertado por el motor
 }
 

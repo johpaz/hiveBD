@@ -132,42 +132,35 @@ El patrón puede filtrar por `agentId`, `kind` y/o `streamId`. Si omites todos, 
 
 ## 5. Memoria semántica híbrida
 
-HiveDB combina búsqueda full-text (BM25 sobre `tantivy`) con búsqueda vectorial (HNSW) y las fusiona con Reciprocal Rank Fusion (RRF).
+HiveDB combina búsqueda full-text (BM25 sobre `tantivy`) con búsqueda vectorial (HNSW) y las fusiona con Reciprocal Rank Fusion (RRF). El análisis de texto está optimizado para español: minúsculas, plegado de acentos ("transacción" ≈ "transaccion") y stemming Snowball ("pagos" ≈ "pago"). El texto en inglés pasa casi intacto por el stemmer español, así que catálogos bilingües funcionan; lo que NO hace el motor es traducir entre idiomas ("correo" no encuentra "email" sin embeddings).
 
-### Indexar un documento
+### Indexar documentos (upsert)
+
+Cada documento tiene tres campos de texto opcionales con pesos distintos en el ranking — `name` (boost 4.0), `tags` (3.0) y `body` (2.0) — un vector opcional y filtros escalares opcionales. `upsertDoc` reemplaza el documento si el id ya existe; nunca duplica.
 
 ```ts
-const DIMENSION = 384; // dimensión fija del índice vectorial
+await db.upsertDoc({
+  id: "tool:send_email",
+  name: "send_email",
+  body: "envía un correo electrónico al destinatario",
+  tags: "comunicación email",
+  filters: [{ field: "type", value: "tool" }],
+});
 
-function embedding(textHint: string, position: number): Float32Array {
-  const v = new Float32Array(DIMENSION);
-  v[position % DIMENSION] = 1;
-  // En producción aquí iría tu modelo de embeddings
-  return v;
-}
-
-await db.indexDoc(
-  "doc-1",
-  "The Eiffel Tower is in Paris",
-  embedding("paris", 0)
-);
-
-await db.indexDoc(
-  "doc-2",
-  "Tokyo is known for sushi and neon lights",
-  embedding("tokyo", 1),
-  [{ field: "city", value: "tokyo" }] // filtros escalares opcionales
-);
+// Lote grande: un solo commit de índice, mucho más rápido.
+await db.upsertBatch(docs);
 ```
 
-### Consultar híbridamente
+El vector es opcional: los documentos solo-texto nunca tocan el índice vectorial. Cuando incluyas vectores, la dimensión (384 por defecto) se fija en el primer `open` y puede configurarse: `HiveDB.open(path, { vectorDimension: 768 })`.
+
+### Consultar
 
 ```ts
 const hits = await db.queryHybrid({
-  text: "Paris landmarks",
-  vector: embedding("paris", 0),
+  text: "¿cómo genero reportes de transacciones?", // texto crudo: nunca lanza error
   k: 5,
-  filters: [{ field: "city", value: "paris" }],
+  filters: [{ field: "type", value: "tool" }],
+  boosts: { name: 4, tags: 3, body: 2 }, // opcional
 });
 
 for (const hit of hits) {
@@ -175,7 +168,25 @@ for (const hit of hits) {
 }
 ```
 
-`queryHybrid` recibe texto opcional, vector opcional, `k` máximo de resultados y filtros escalares. Puedes consultar solo por texto, solo por vector, o ambos.
+Puedes consultar solo por texto, solo por vector, o ambos. La semántica del `score` depende del modo:
+
+| Modo | `score` |
+|---|---|
+| Solo texto | BM25 crudo (positivo, mayor = mejor) |
+| Solo vector | Similitud coseno (0-1) |
+| Híbrido | Fusión RRF (`fusion: { kind: "rrf", k: 60 }` configurable); `textScore` y `vectorScore` traen los componentes crudos |
+
+El parsing del texto es tolerante: comillas sin cerrar, operadores y signos de puntuación degradan a una búsqueda bolsa-de-palabras en lugar de fallar.
+
+### Borrar y mantener
+
+```ts
+await db.deleteDoc("tool:send_email");                       // por id
+await db.deleteByFilter({ field: "server_id", value: "a" }); // por filtro (p. ej. hot-reload MCP)
+await db.clearIndex();                                       // vaciar todo el índice
+```
+
+`HiveDB.open(":memory:")` abre una base efímera (ideal para tests) con el índice semántico completo.
 
 ---
 
@@ -273,16 +284,34 @@ interface Event {
   payload: string;
 }
 
+interface IndexDoc {
+  id: string;
+  name?: string;   // boost 4.0
+  body?: string;   // boost 2.0
+  tags?: string;   // boost 3.0
+  vector?: Float32Array; // dimensión configurable (default 384)
+  filters?: ScalarFilter[];
+}
+
 interface HybridQuery {
   text?: string;
-  vector?: Float32Array; // dimensión 384
+  vector?: Float32Array;
   k: number;
   filters?: ScalarFilter[];
+  fusion?: { kind: "rrf"; k?: number };
+  boosts?: { name?: number; body?: number; tags?: number };
 }
 
 interface ScalarFilter {
   field: string;
   value: string;
+}
+
+interface Hit {
+  id: string;
+  score: number;       // BM25 | coseno | RRF según el modo
+  textScore?: number;
+  vectorScore?: number;
 }
 
 interface Decision {
@@ -291,12 +320,17 @@ interface Decision {
 }
 
 class HiveDB {
-  static open(path: string): Promise<HiveDB>;
+  static open(path: string, options?: { vectorDimension?: number }): Promise<HiveDB>;
   append(input: EventInput): Promise<number>;
   read(seq: number): Promise<Event>;
   logLen(): Promise<number>;
   can(agent: string, action: string, resource: string): Promise<Decision>;
-  indexDoc(id: string, text: string, vector: Float32Array, filters?: ScalarFilter[]): Promise<void>;
+  upsertDoc(doc: IndexDoc): Promise<void>;
+  upsertBatch(docs: IndexDoc[]): Promise<void>;
+  deleteDoc(id: string): Promise<void>;
+  deleteByFilter(filter: ScalarFilter): Promise<void>;
+  clearIndex(): Promise<void>;
+  indexDoc(id: string, text: string, vector: Float32Array, filters?: ScalarFilter[]): Promise<void>; // deprecado
   queryHybrid(query: HybridQuery): Promise<Hit[]>;
   events(pattern: EventPattern): AsyncIterable<Event> & { close(): void };
   subscribe(pattern: EventPattern, onEvent: (event: Event) => void): Subscription;

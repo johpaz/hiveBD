@@ -101,6 +101,123 @@ describe("G8 napi-rs binding", () => {
     expect(received[0].kindTag).toBe("Fact");
   });
 
+  it("§4.12 upserts text-only docs and searches with Spanish morphology", async () => {
+    await db.upsertBatch([
+      {
+        id: "tool:send_email",
+        name: "send_email",
+        body: "envía un correo electrónico al destinatario",
+        tags: "comunicación email",
+        filters: [{ field: "type", value: "tool" }],
+      },
+      {
+        id: "skill:reportes",
+        name: "generación de reportes",
+        body: "genera reportes mensuales de transacciones",
+        tags: "reportes análisis",
+        filters: [{ field: "type", value: "skill" }],
+      },
+    ]);
+
+    // Accent-less + morphological variant matches the accented document.
+    const hits = await db.queryHybrid({ text: "transacciones", k: 5 });
+    expect(hits.length).toBe(1);
+    expect(hits[0].id).toBe("skill:reportes");
+    expect(hits[0].score).toBeGreaterThan(0);
+    expect(hits[0].textScore).toBe(hits[0].score);
+
+    // Type filter narrows results.
+    const toolHits = await db.queryHybrid({
+      text: "correo reportes",
+      k: 5,
+      filters: [{ field: "type", value: "tool" }],
+    });
+    expect(toolHits.length).toBe(1);
+    expect(toolHits[0].id).toBe("tool:send_email");
+  });
+
+  it("§4.12b raw user input with operators never throws", async () => {
+    await db.upsertDoc({ id: "d1", body: "envía el correo" });
+    for (const text of ['"correo sin cerrar', "¿puedes enviar (el) correo?", "a:b* OR NOT"]) {
+      const hits = await db.queryHybrid({ text, k: 5 });
+      expect(Array.isArray(hits)).toBe(true);
+    }
+  });
+
+  it("§4.12c upsert replaces, delete and deleteByFilter remove docs", async () => {
+    await db.upsertDoc({
+      id: "mcp:a/1",
+      body: "herramienta uno",
+      filters: [{ field: "server_id", value: "a" }],
+    });
+    await db.upsertDoc({
+      id: "mcp:a/2",
+      body: "herramienta dos",
+      filters: [{ field: "server_id", value: "a" }],
+    });
+    await db.upsertDoc({ id: "mcp:b/1", body: "herramienta tres" });
+
+    // Upsert replaces content without duplicating.
+    await db.upsertDoc({ id: "mcp:b/1", body: "utilidad renombrada" });
+    let hits = await db.queryHybrid({ text: "herramienta", k: 10 });
+    expect(hits.map((h) => h.id).sort()).toEqual(["mcp:a/1", "mcp:a/2"]);
+
+    await db.deleteByFilter({ field: "server_id", value: "a" });
+    hits = await db.queryHybrid({ text: "herramienta utilidad", k: 10 });
+    expect(hits.map((h) => h.id)).toEqual(["mcp:b/1"]);
+
+    await db.deleteDoc("mcp:b/1");
+    hits = await db.queryHybrid({ text: "utilidad", k: 10 });
+    expect(hits.length).toBe(0);
+  });
+
+  it("§4.12d clearIndex empties the semantic index", async () => {
+    await db.upsertBatch([
+      { id: "x1", body: "contenido uno" },
+      { id: "x2", body: "contenido dos" },
+    ]);
+    await db.clearIndex();
+    const hits = await db.queryHybrid({ text: "contenido", k: 10 });
+    expect(hits.length).toBe(0);
+  });
+
+  it('§4.12e ":memory:" mode supports the full search lifecycle', async () => {
+    const mem = await HiveDB.open(":memory:");
+    try {
+      await mem.upsertDoc({ id: "m1", name: "buscar reuniones", body: "transcripción de reunión" });
+      const hits = await mem.queryHybrid({ text: "reunion", k: 5 });
+      expect(hits.length).toBe(1);
+      expect(hits[0].id).toBe("m1");
+    } finally {
+      mem.close();
+    }
+  });
+
+  it("§4.12f vector dimension is configurable at open", async () => {
+    const dir = tempDir("hive-g8-dim-");
+    const small = await HiveDB.open(dir, { vectorDimension: 8 });
+    try {
+      const v = new Float32Array(8);
+      v[0] = 1;
+      await small.upsertDoc({ id: "v1", body: "doc con vector corto", vector: v });
+      const hits = await small.queryHybrid({ vector: v, k: 1 });
+      expect(hits.length).toBe(1);
+      expect(hits[0].id).toBe("v1");
+      expect(hits[0].vectorScore!).toBeGreaterThan(0.99);
+    } finally {
+      small.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+
+    // Reopening with a different dimension must fail loudly.
+    await expect(async () => {
+      const dir2 = tempDir("hive-g8-dim2-");
+      const a = await HiveDB.open(dir2, { vectorDimension: 8 });
+      a.close();
+      await HiveDB.open(dir2, { vectorDimension: 16 });
+    }).toThrow();
+  });
+
   it("§4.11d 1000 open/append/close cycles stay within 50 MB RSS growth", async () => {
     const root = tempDir("hive-g8-leak-");
     const before = (process as any).memoryUsage().rss as number;

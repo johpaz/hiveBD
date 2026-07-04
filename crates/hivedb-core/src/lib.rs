@@ -14,7 +14,7 @@ pub mod shard;
 pub mod state;
 
 pub use clock::{Clock, MockClock, SystemClock};
-pub use db::{Decision, HiveDB};
+pub use db::{Decision, HiveDB, OpenOptions};
 pub use error::{HiveError, HiveResult};
 pub use event::{AgentId, Event, EventInput, EventKind, EventKindTag, Scope, StreamId};
 pub use projection::Projection;
@@ -27,4 +27,4 @@ pub use state::{
 
 // Re-export hybrid-search types from the index layer so consumers only need
 // one import.
-pub use hivedb_index::{Fusion, Hit, HybridQuery, ScalarFilter};
+pub use hivedb_index::{FieldBoosts, Fusion, Hit, HybridQuery, IndexDoc, ScalarFilter};

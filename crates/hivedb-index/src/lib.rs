@@ -11,7 +11,7 @@ pub use hnsw::VectorIndex;
 pub use index::SemanticIndex;
 pub use rrf::rrf;
 pub use text::TextIndex;
-pub use types::{Fusion, Hit, HybridQuery, ScalarFilter};
+pub use types::{FieldBoosts, Fusion, Hit, HybridQuery, IndexDoc, ScalarFilter};
 
 /// Result type used across `hivedb-index`.
 pub type Result<T> = std::result::Result<T, IndexError>;
