@@ -153,6 +153,11 @@ jobs:
         with:
           bun-version: latest
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -181,8 +186,8 @@ jobs:
         run: bun test
 
   publish:
-    name: Publish to npm
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    name: Publish to npm + GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: [lint-and-test, build, test-bun]
     runs-on: ubuntu-latest
     permissions:
@@ -198,7 +203,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           registry-url: https://registry.npmjs.org
 
       - name: Install dependencies
@@ -248,7 +253,6 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Create GitHub Release
-        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
