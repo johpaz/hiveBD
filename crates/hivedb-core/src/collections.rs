@@ -134,8 +134,8 @@ impl Collections {
                 {
                     let (key, value) = entry.map_err(|e| HiveError::StorageError(Box::new(e)))?;
                     let (collection, field) = key.value();
-                    let def: IndexDef = bincode::deserialize(&value.value())
-                        .map_err(HiveError::Serialization)?;
+                    let def: IndexDef =
+                        bincode::deserialize(&value.value()).map_err(HiveError::Serialization)?;
                     defs.entry(collection.to_string())
                         .or_default()
                         .insert(field.to_string(), def);
