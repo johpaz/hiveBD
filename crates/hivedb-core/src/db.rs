@@ -1,4 +1,5 @@
 use crate::clock::{Clock, SystemClock, into_clock};
+use crate::collections::{ColOp, Collections, DocEntry, PutOptions, ScanOptions};
 use crate::error::HiveResult;
 use crate::event::{AgentId, Event, EventInput, EventKind, StreamId};
 use crate::log::EventLog;
@@ -77,9 +78,14 @@ pub struct HiveDB {
     log: LogHandle,
     working: Arc<WorkingMemory>,
     semantic: Option<Arc<SemanticIndex>>,
+    collections: Option<Arc<Collections>>,
     reactive: Arc<ReactiveEngine>,
     clock: Arc<dyn Clock>,
     base_path: PathBuf,
+    /// Keeps ephemeral databases (`open_temp` / `":memory:"`) alive: the
+    /// directory is removed from disk when the last clone drops. `None` for
+    /// persistent databases.
+    _temp_dir: Option<Arc<tempfile::TempDir>>,
 }
 
 /// Internal handle that hides whether the log is backed by sharded `redb`
@@ -182,20 +188,23 @@ impl HiveDB {
         let log = LogHandle::Redb(Arc::new(EventLog::open(&base, registry, clock.clone())?));
         let working = Arc::new(WorkingMemory::new());
         let semantic = Some(Arc::new(SemanticIndex::open(&base, dimension)?));
+        let collections = Some(Arc::new(Collections::open(&base)?));
         let reactive = Arc::new(ReactiveEngine::new());
 
         Ok(Self {
             log,
             working,
             semantic,
+            collections,
             reactive,
             clock,
             base_path: base,
+            _temp_dir: None,
         })
     }
 
-    /// Open a temporary database. The data directory lives for the remainder of
-    /// the process.
+    /// Open a temporary database. The data directory is removed from disk
+    /// when the last clone of the handle drops.
     pub fn open_temp() -> HiveResult<Self> {
         Self::open_temp_with_clock(into_clock(SystemClock))
     }
@@ -216,21 +225,22 @@ impl HiveDB {
     pub fn open_in_memory_with_clock(clock: Arc<dyn Clock>) -> HiveResult<Self> {
         let dir = tempfile::tempdir()?;
         let base = dir.path().to_path_buf();
-        // Leak the TempDir so the files stay alive for the lifetime of the process.
-        let _ = Box::leak(Box::new(dir));
 
         let log = LogHandle::Memory(Arc::new(MemoryEventLog::new(clock.clone())));
         let working = Arc::new(WorkingMemory::new());
         let semantic = None;
+        let collections = None;
         let reactive = Arc::new(ReactiveEngine::new());
 
         Ok(Self {
             log,
             working,
             semantic,
+            collections,
             reactive,
             clock,
             base_path: base,
+            _temp_dir: Some(Arc::new(dir)),
         })
     }
 
@@ -241,17 +251,16 @@ impl HiveDB {
     }
 
     /// Open a temporary database with an explicit clock source and options.
+    /// The backing directory is removed when the last clone drops.
     #[doc(hidden)]
     pub fn open_temp_with_clock_and_options(
         clock: Arc<dyn Clock>,
         options: OpenOptions,
     ) -> HiveResult<Self> {
         let dir = tempfile::tempdir()?;
-        let base = dir.path().to_path_buf();
-        // Leak the TempDir so the files stay alive for the lifetime of the process.
-        let _ = Box::leak(Box::new(dir));
-
-        Self::open_with_clock_and_options(base, clock, options)
+        let mut db = Self::open_with_clock_and_options(dir.path(), clock, options)?;
+        db._temp_dir = Some(Arc::new(dir));
+        Ok(db)
     }
 
     /// Open a temporary database with explicit options.
@@ -347,6 +356,68 @@ impl HiveDB {
     /// Remove every document from the semantic index.
     pub fn clear_index(&self) -> HiveResult<()> {
         self.semantic()?.clear().map_err(Into::into)
+    }
+
+    fn collections(&self) -> HiveResult<&Collections> {
+        self.collections.as_deref().ok_or_else(|| {
+            crate::error::HiveError::InvalidInput(
+                "collections not available in in-memory mode".into(),
+            )
+        })
+    }
+
+    /// Insert or replace a JSON document in a collection. Returns the new
+    /// version (starts at 1).
+    pub fn col_put(
+        &self,
+        collection: &str,
+        id: &str,
+        doc: &Value,
+        options: PutOptions,
+    ) -> HiveResult<u64> {
+        self.collections()?.put(collection, id, doc, options)
+    }
+
+    /// Read a document by id.
+    pub fn col_get(&self, collection: &str, id: &str) -> HiveResult<Option<DocEntry>> {
+        self.collections()?.get(collection, id)
+    }
+
+    /// Delete a document. Returns `true` if it existed.
+    pub fn col_delete(&self, collection: &str, id: &str) -> HiveResult<bool> {
+        self.collections()?.delete(collection, id)
+    }
+
+    /// Scan a collection in id order.
+    pub fn col_scan(&self, collection: &str, options: &ScanOptions) -> HiveResult<Vec<DocEntry>> {
+        self.collections()?.scan(collection, options)
+    }
+
+    /// Number of documents in a collection.
+    pub fn col_count(&self, collection: &str) -> HiveResult<u64> {
+        self.collections()?.count(collection)
+    }
+
+    /// Create an equality index on a top-level field (optionally unique).
+    pub fn col_create_index(&self, collection: &str, field: &str, unique: bool) -> HiveResult<()> {
+        self.collections()?.create_index(collection, field, unique)
+    }
+
+    /// Look up documents whose indexed field equals `value`.
+    pub fn col_find_by(
+        &self,
+        collection: &str,
+        field: &str,
+        value: &Value,
+        options: &ScanOptions,
+    ) -> HiveResult<Vec<DocEntry>> {
+        self.collections()?
+            .find_by(collection, field, value, options)
+    }
+
+    /// Apply several puts/deletes atomically across collections.
+    pub fn col_batch(&self, ops: &[ColOp]) -> HiveResult<()> {
+        self.collections()?.batch(ops)
     }
 
     /// Index a document for hybrid search.

@@ -1,6 +1,7 @@
 //! HiveDB core — event-log append-only engine with deterministic projections.
 
 pub mod clock;
+pub mod collections;
 pub mod db;
 pub mod error;
 pub mod event;
@@ -14,6 +15,7 @@ pub mod shard;
 pub mod state;
 
 pub use clock::{Clock, MockClock, SystemClock};
+pub use collections::{ColOp, Collections, DocEntry, PutOptions, ScanOptions};
 pub use db::{Decision, HiveDB, OpenOptions};
 pub use error::{HiveError, HiveResult};
 pub use event::{AgentId, Event, EventInput, EventKind, EventKindTag, Scope, StreamId};

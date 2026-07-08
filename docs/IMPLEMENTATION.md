@@ -153,7 +153,7 @@ No expongas `seq` ni `timestamp` en `EventInput`. Hay un test `compile_fail` (`t
 
 ### Dimensión vectorial
 
-La constante `VECTOR_DIMENSION` en `hivedb-core/src/db.rs` fija la dimensión en **384**. Todos los vectores indexados o consultados deben tener ese tamaño.
+Configurable por base vía `OpenOptions { vector_dimension }` (default 384 si no se especifica). `db.rs::resolve_vector_dimension()` la persiste en `meta.json` al crear la base y valida que coincida en cada `open` posterior — reabrir con una dimensión distinta falla con un error explícito en vez de corromper el índice.
 
 ### Persistencia de vectores
 
@@ -171,7 +171,40 @@ Actualmente solo `ScalarFilter::Eq { field, value }`, sobre **cualquier campo**.
 
 ---
 
-## 8. Grafo de consentimiento (`hivedb-core/src/state/consent_graph.rs`)
+## 8. Colecciones de documentos (`hivedb-core/src/collections.rs`)
+
+CRUD mutable sobre `redb`, independiente del event-log — la contraparte de tablas relacionales de SQLite. Añadido en el gate G10 (el nombre de archivo de tests quedó como `g9_collections.rs`/`g9_collections.test.ts` por una colisión de numeración con el gate G9 de distribución napi; es cosmético).
+
+### Tablas `redb`
+
+| Tabla | Clave | Contenido |
+|---|---|---|
+| `col_docs` | `(collection, id)` | `StoredDoc { version, json }` |
+| `col_index_entries` | `(collection, field, value_token, id)` | entrada de índice secundario (marcador, sin valor) |
+| `col_index_defs` | `(collection, field)` | `IndexDef { unique }` — persiste entre reaperturas |
+
+### Versionado optimista
+
+Cada `put` incrementa `version`. `PutOptions.expected_version`: `None` = sin chequeo, `Some(0)` = crear-solo, `Some(n)` = debe coincidir con la versión actual o falla con `version conflict`.
+
+### Índices secundarios
+
+`col_create_index(collection, field, unique)` recorre (`scan`) todos los docs existentes y los indexa (backfill). Si `unique` y hay un duplicado, la creación falla y no deja índice a medias — se revisa el conjunto completo antes de escribir cualquier entrada. Solo valores JSON escalares (string/number/bool) se indexan; arrays, objetos y campos ausentes se omiten sin error. El mantenimiento del índice (altas/bajas/cambios de valor) ocurre dentro de la misma transacción que el `put`/`delete` del documento vía los helpers compartidos `put_in_txn()` / `delete_in_txn()`.
+
+### Batches atómicos
+
+`col_batch(&[ColOp::Put{..} | ColOp::Delete{..}])` abre una única transacción `redb` (`begin_write()`) y aplica cada op con los mismos helpers `put_in_txn`/`delete_in_txn` que usan los métodos de una sola operación — garantiza que un fallo a mitad de la lista (p. ej. version conflict) aborta toda la transacción sin dejar cambios parciales.
+
+### Añadir un nuevo método de colección
+
+1. Implementa la función en `collections.rs` operando sobre `&Database` o dentro de una `WriteTransaction` si necesita atomicidad con otras ops.
+2. Expón el facade en `db.rs` (`col_*`).
+3. Añade el método napi en `hivedb-napi/src/lib.rs` (tipos `Js*` si el payload cruza la frontera FFI).
+4. Añade el método en la clase `Collection<T>` de `packages/hive-db/src/index.ts`.
+
+---
+
+## 9. Grafo de consentimiento (`hivedb-core/src/state/consent_graph.rs`)
 
 - Proyección **global**.
 - Estado: `BTreeMap<u64, Grant>` donde la clave es el `seq` del evento `ConsentGranted`.
@@ -184,7 +217,7 @@ Actualmente solo `ScalarFilter::Eq { field, value }`, sobre **cualquier campo**.
 
 ---
 
-## 9. Binding napi-rs (`hivedb-napi`)
+## 10. Binding napi-rs (`hivedb-napi`)
 
 ### Reglas importantes
 
@@ -213,7 +246,7 @@ El artefacto es un shared object renombrado a `.node` para que Bun/Node lo cargu
 
 ---
 
-## 10. Tests
+## 11. Tests
 
 ### Rust
 
@@ -241,7 +274,7 @@ bun test
 
 ---
 
-## 11. Convenciones de código
+## 12. Convenciones de código
 
 - Formato con `rustfmt`.
 - Clippy sin warnings (`-D warnings`).
@@ -251,7 +284,7 @@ bun test
 
 ---
 
-## 12. Roadmap técnico próximo
+## 13. Roadmap técnico próximo
 
 1. Convertir `loom` en `dev-dependency` o feature; hoy es dependencia normal por facilidad de compilación.
 2. Exponer working memory en el binding TS.
@@ -260,7 +293,7 @@ bun test
 
 ---
 
-## 13. Distribución con `@napi-rs/cli`
+## 14. Distribución con `@napi-rs/cli`
 
 El binding nativo se construye, empaqueta y publica usando `@napi-rs/cli` 3.x. Ver `docs/DISTRIBUTION.md` para la guía completa.
 

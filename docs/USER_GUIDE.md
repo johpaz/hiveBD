@@ -233,7 +233,74 @@ Cada llamada a `can` genera automáticamente un evento `IntentLogged` en el log 
 
 ---
 
-## 7. Memoria de trabajo (Working Memory)
+## 7. Colecciones de documentos (CRUD mutable)
+
+A diferencia del event-log (append-only), las colecciones son un almacén de documentos JSON mutable con `put`/`get`/`delete`/`scan` — la pieza que falta para reemplazar tablas relacionales estilo SQLite sin salir de HiveDB.
+
+```ts
+interface Agent {
+  name: string;
+  role: string;
+}
+
+const agents = db.collection<Agent>("agents");
+
+const version = await agents.put("a1", { name: "Atlas", role: "worker" }); // 1
+const entry = await agents.get("a1"); // { id: "a1", version: 1, doc: { name: "Atlas", role: "worker" } }
+await agents.delete("a1"); // true si existía
+```
+
+### Versionado optimista
+
+`put` acepta `expectedVersion` para evitar pisar cambios concurrentes. `expectedVersion: 0` significa "crear solo si no existe". Un desajuste lanza (`version conflict`).
+
+```ts
+await agents.put("a1", { name: "Atlas", role: "worker" }, { expectedVersion: 0 }); // crea
+await agents.put("a1", { name: "Atlas", role: "coordinator" }, { expectedVersion: 1 }); // actualiza
+await agents.put("a1", { name: "Atlas", role: "coordinator" }, { expectedVersion: 1 }); // lanza: ya está en versión 2
+```
+
+### Scan
+
+```ts
+await agents.scan({ prefix: "a", limit: 20, reverse: false });
+await agents.count();
+```
+
+Recorre por orden lexicográfico de `id`; `prefix` filtra, `offset`/`limit` paginan, `reverse` invierte el orden.
+
+### Índices secundarios
+
+`createIndex` indexa un campo escalar (string/number/bool) del documento y hace backfill de los documentos existentes. `unique: true` rechaza duplicados (en el `put` y también durante el backfill). Campos ausentes o no-escalares (arrays, objetos) se omiten del índice en vez de fallar.
+
+```ts
+await agents.createIndex("role");
+const workers = await agents.findBy("role", "worker"); // DocEntry[]
+
+await agents.createIndex("email", { unique: true });
+await agents.put("a2", { email: "dup@x.com" }); // ok
+await agents.put("a3", { email: "dup@x.com" }); // lanza: unique index violado
+```
+
+`findBy` sobre un campo sin índice creado lanza explícitamente — no hay full-scan implícito.
+
+### Batches atómicos
+
+`db.batch(ops)` aplica varias operaciones (incluso en distintas colecciones) en una sola transacción: o se aplican todas, o ninguna.
+
+```ts
+await db.batch([
+  { op: "put", collection: "agents", id: "a1", doc: { name: "Atlas" } },
+  { op: "put", collection: "agents", id: "a2", doc: { name: "Nova" }, expectedVersion: 3 },
+  { op: "delete", collection: "logs", id: "stale-1" },
+]);
+```
+
+Si cualquier operación falla (por ejemplo un `expectedVersion` desactualizado), nada del batch se commitea.
+
+---
+
+## 8. Memoria de trabajo (Working Memory)
 
 Para datos transitorios que no necesitan durabilidad de log pero sí rápido acceso con TTL:
 
@@ -241,7 +308,7 @@ Para datos transitorios que no necesitan durabilidad de log pero sí rápido acc
 
 ---
 
-## 8. Cierre y ciclo de vida
+## 9. Cierre y ciclo de vida
 
 ```ts
 db.close();
@@ -253,7 +320,7 @@ Si necesitas reconstruir las proyecciones desde cero (por ejemplo tras añadir u
 
 ---
 
-## 9. Patrones recomendados para agentes
+## 10. Patrones recomendados para agentes
 
 1. **Un `agentId` por agente autónomo.** No compartas `agentId` entre instancias concurrentes si no quieres contención de escritura.
 2. **Un `streamId` por objetivo o conversación.** Facilita leer la historia completa de una tarea.
@@ -263,7 +330,7 @@ Si necesitas reconstruir las proyecciones desde cero (por ejemplo tras añadir u
 
 ---
 
-## 10. Referencia rápida de tipos
+## 11. Referencia rápida de tipos
 
 ```ts
 interface EventInput {
@@ -319,6 +386,38 @@ interface Decision {
   intentLogSeq?: number;
 }
 
+interface DocEntry<T = unknown> {
+  id: string;
+  version: number;
+  doc: T;
+}
+
+interface PutDocOptions {
+  expectedVersion?: number; // 0 = crear solo si no existe
+}
+
+interface ScanOptions {
+  prefix?: string;
+  start?: string;
+  offset?: number;
+  limit?: number;
+  reverse?: boolean;
+}
+
+type BatchOp =
+  | { op: "put"; collection: string; id: string; doc: unknown; expectedVersion?: number }
+  | { op: "delete"; collection: string; id: string };
+
+class Collection<T = unknown> {
+  put(id: string, doc: T, options?: PutDocOptions): Promise<number>; // -> nueva versión
+  get(id: string): Promise<DocEntry<T> | undefined>;
+  delete(id: string): Promise<boolean>;
+  scan(options?: ScanOptions): Promise<DocEntry<T>[]>;
+  count(): Promise<number>;
+  createIndex(field: string, options?: { unique?: boolean }): Promise<void>;
+  findBy(field: string, value: string | number | boolean): Promise<DocEntry<T>[]>;
+}
+
 class HiveDB {
   static open(path: string, options?: { vectorDimension?: number }): Promise<HiveDB>;
   append(input: EventInput): Promise<number>;
@@ -334,6 +433,8 @@ class HiveDB {
   queryHybrid(query: HybridQuery): Promise<Hit[]>;
   events(pattern: EventPattern): AsyncIterable<Event> & { close(): void };
   subscribe(pattern: EventPattern, onEvent: (event: Event) => void): Subscription;
+  collection<T = unknown>(name: string): Collection<T>;
+  batch(ops: BatchOp[]): Promise<void>;
   close(): void;
 }
 ```

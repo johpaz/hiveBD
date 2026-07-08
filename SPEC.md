@@ -181,6 +181,28 @@ struct HybridQuery {
 }
 ```
 
+### 4.4 Colecciones de documentos (CRUD mutable sobre `redb`)
+
+- Cuarto tier, distinto del event-log: mientras la memoria episódica es append-only e inmutable, las colecciones son un almacén de documentos JSON **mutable** (put/get/delete/scan) para el estado que no tiene semántica de evento — la contraparte de las tablas relacionales de SQLite.
+- Documento = `{ id: string, version: u64, doc: JSON }`. `version` habilita **control de concurrencia optimista**: `put(id, doc, { expectedVersion })` falla con `version conflict` si la versión no coincide (o si `expectedVersion: 0` y el documento ya existe).
+- Colecciones son namespaces por nombre de string; dos colecciones nunca comparten ids (`col_docs` está keyed por `(collection, id)`).
+- **Índices secundarios de igualdad**: `createIndex(field, { unique? })` indexa un campo escalar (string/number/bool) del documento. Backfilla docs existentes al crearse; si el backfill encuentra un duplicado bajo `unique`, la creación del índice falla sin dejar rastro. Campos no-escalares (arrays, objetos) o ausentes se omiten silenciosamente del índice. `findBy(field, value)` sin índice creado sobre ese campo es un error explícito (no hay full-scan implícito).
+- **Scan**: `scan({ prefix?, start?, offset?, limit?, reverse? })` recorre por orden lexicográfico de `id`.
+- **Batch atómico**: `batch(ops)` aplica una lista de `Put`/`Delete` (potencialmente sobre distintas colecciones) en una sola transacción `redb` — si un op falla (p. ej. version conflict), nada se commitea.
+- Tres tablas `redb` por debajo: `col_docs`, `col_index_entries`, `col_index_defs` (las definiciones de índice persisten y se re-verifican al reabrir la base).
+- Coexiste en la misma base que el event-log y el índice semántico — un solo `HiveDB.open(path)` sirve los tres.
+
+```rust
+// Núcleo Rust (hivedb-core)
+db.col_put("agents", "a1", &json!({"name": "Atlas"}), PutOptions::default())?; // -> version
+db.col_get("agents", "a1")?;        // -> Option<DocEntry>
+db.col_delete("agents", "a1")?;     // -> bool
+db.col_scan("agents", &ScanOptions::default())?;
+db.col_create_index("agents", "name", /* unique */ false)?;
+db.col_find_by("agents", "name", &Value::from("Atlas"), &ScanOptions::default())?;
+db.col_batch(&[ColOp::Put { .. }, ColOp::Delete { .. }])?;
+```
+
 ---
 
 ## 5. Concurrencia: muchos lectores, escritura particionada por agente
@@ -273,6 +295,17 @@ for await (const ev of db.events({ kind: "ToolCall" })) {
 
 // Consentimiento
 const decision = await db.can("FrontendEngineer", "deploy", "prod");
+
+// Colecciones de documentos (CRUD mutable, versionado optimista)
+const agents = db.collection<{ name: string; role: string }>("agents");
+const version = await agents.put("a1", { name: "Atlas", role: "worker" });
+const entry = await agents.get("a1"); // -> { id, version, doc } | undefined
+await agents.createIndex("role");
+const workers = await agents.findBy("role", "worker");
+await db.batch([
+  { op: "put", collection: "agents", id: "a2", doc: { name: "Nova", role: "coordinator" } },
+  { op: "delete", collection: "agents", id: "a1" },
+]);
 ```
 
 ---
@@ -282,6 +315,7 @@ const decision = await db.can("FrontendEngineer", "deploy", "prod");
 ```
 ./hive-data/
 ├── log.redb           # event-log append-only + proyecciones (redb)
+├── collections.redb   # colecciones de documentos: docs, índices secundarios, defs
 ├── fts/               # índice tantivy (BM25)
 ├── vec/               # índice hnsw_rs (ANN)
 ├── snapshots/         # snapshots opcionales de working memory

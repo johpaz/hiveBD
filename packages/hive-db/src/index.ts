@@ -24,6 +24,14 @@ interface JsHiveDbInner {
   deleteDoc(id: string): Promise<void>;
   deleteByFilter(filter: JsScalarFilter): Promise<void>;
   clearIndex(): Promise<void>;
+  colPut(collection: string, id: string, json: string, options?: JsPutOptions): Promise<number>;
+  colGet(collection: string, id: string): Promise<JsDocEntry | null>;
+  colDelete(collection: string, id: string): Promise<boolean>;
+  colScan(collection: string, options?: JsScanOptions): Promise<JsDocEntry[]>;
+  colCount(collection: string): Promise<number>;
+  colCreateIndex(collection: string, field: string, unique: boolean): Promise<void>;
+  colFindBy(collection: string, field: string, valueJson: string, options?: JsScanOptions): Promise<JsDocEntry[]>;
+  colBatch(ops: JsColOp[]): Promise<void>;
   queryHybrid(query: JsHybridQuery): Promise<JsHit[]>;
   subscribe(
     pattern: JsEventPattern,
@@ -43,6 +51,32 @@ interface JsIndexDoc {
   tags?: string;
   vector?: Float32Array;
   filters?: JsScalarFilter[];
+}
+
+interface JsDocEntry {
+  id: string;
+  version: number;
+  json: string;
+}
+
+interface JsPutOptions {
+  expectedVersion?: number;
+}
+
+interface JsScanOptions {
+  prefix?: string;
+  start?: string;
+  limit?: number;
+  offset?: number;
+  reverse?: boolean;
+}
+
+interface JsColOp {
+  op: string;
+  collection: string;
+  id: string;
+  json?: string;
+  expectedVersion?: number;
 }
 
 interface JsSubscriptionInner {
@@ -200,6 +234,101 @@ export interface Hit {
   vectorScore?: number;
 }
 
+/** A document read from a collection. */
+export interface DocEntry<T = unknown> {
+  id: string;
+  /** Monotonic per-document version, starting at 1 on first put. */
+  version: number;
+  doc: T;
+}
+
+export interface PutDocOptions {
+  /**
+   * Optimistic concurrency: the current stored version must equal this value
+   * (0 = the document must not exist yet). Omit for unconditional upsert.
+   */
+  expectedVersion?: number;
+}
+
+export interface ScanOptions {
+  /** Only ids starting with this prefix. */
+  prefix?: string;
+  /** Start at this id (inclusive, ascending id order). */
+  start?: string;
+  /** Maximum entries to return. */
+  limit?: number;
+  /** Entries to skip before collecting. */
+  offset?: number;
+  /** Return entries in descending id order. */
+  reverse?: boolean;
+}
+
+/** One operation inside an atomic HiveDB.batch(). */
+export type BatchOp =
+  | { op: "put"; collection: string; id: string; doc: unknown; expectedVersion?: number }
+  | { op: "delete"; collection: string; id: string };
+
+/**
+ * Typed handle to a named document collection (mutable CRUD storage,
+ * separate from the immutable event log). Every write commits atomically
+ * with its secondary-index maintenance.
+ */
+export class Collection<T = unknown> {
+  constructor(
+    private inner: JsHiveDbInner,
+    private name: string
+  ) {}
+
+  /** Insert or replace a document. Returns the new version (starts at 1). */
+  async put(id: string, doc: T, options?: PutDocOptions): Promise<number> {
+    return this.inner.colPut(this.name, id, JSON.stringify(doc), options);
+  }
+
+  /** Read a document by id. */
+  async get(id: string): Promise<DocEntry<T> | undefined> {
+    const entry = await this.inner.colGet(this.name, id);
+    if (!entry) return undefined;
+    return { id: entry.id, version: entry.version, doc: JSON.parse(entry.json) as T };
+  }
+
+  /** Delete a document. Returns true if it existed. */
+  async delete(id: string): Promise<boolean> {
+    return this.inner.colDelete(this.name, id);
+  }
+
+  /** Scan the collection in id order. */
+  async scan(options?: ScanOptions): Promise<DocEntry<T>[]> {
+    const entries = await this.inner.colScan(this.name, options);
+    return entries.map((e) => ({ id: e.id, version: e.version, doc: JSON.parse(e.json) as T }));
+  }
+
+  /** Number of documents in the collection. */
+  async count(): Promise<number> {
+    return this.inner.colCount(this.name);
+  }
+
+  /**
+   * Create an equality index on a top-level field (optionally unique).
+   * Backfills existing documents; idempotent for an identical definition.
+   */
+  async createIndex(field: string, options?: { unique?: boolean }): Promise<void> {
+    return this.inner.colCreateIndex(this.name, field, options?.unique ?? false);
+  }
+
+  /**
+   * Look up documents whose indexed field equals `value` (scalar equality).
+   * Requires a previous createIndex on that field.
+   */
+  async findBy(
+    field: string,
+    value: string | number | boolean,
+    options?: ScanOptions
+  ): Promise<DocEntry<T>[]> {
+    const entries = await this.inner.colFindBy(this.name, field, JSON.stringify(value), options);
+    return entries.map((e) => ({ id: e.id, version: e.version, doc: JSON.parse(e.json) as T }));
+  }
+}
+
 export interface EventPattern {
   agentId?: string;
   kind?: EventInput["kind"];
@@ -281,6 +410,31 @@ export class HiveDB {
   /** Remove every document from the semantic index. */
   async clearIndex(): Promise<void> {
     return this.inner.clearIndex();
+  }
+
+  /** Typed handle to a named document collection. */
+  collection<T = unknown>(name: string): Collection<T> {
+    return new Collection<T>(this.inner, name);
+  }
+
+  /**
+   * Apply several puts/deletes atomically across collections: either every
+   * operation commits or none does.
+   */
+  async batch(ops: BatchOp[]): Promise<void> {
+    return this.inner.colBatch(
+      ops.map((op) =>
+        op.op === "put"
+          ? {
+              op: "put",
+              collection: op.collection,
+              id: op.id,
+              json: JSON.stringify(op.doc),
+              expectedVersion: op.expectedVersion,
+            }
+          : { op: "delete", collection: op.collection, id: op.id }
+      )
+    );
   }
 
   async queryHybrid(query: HybridQuery): Promise<Hit[]> {

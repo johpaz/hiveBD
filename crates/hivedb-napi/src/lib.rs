@@ -1,5 +1,6 @@
 use hivedb_core::{
-    AgentId, Decision, EventInput, EventKind, EventPattern, HiveDB, OpenOptions, StreamId,
+    AgentId, ColOp, Decision, DocEntry, EventInput, EventKind, EventPattern, HiveDB, OpenOptions,
+    PutOptions, ScanOptions, StreamId,
 };
 use hivedb_index::{FieldBoosts, Fusion, Hit as CoreHit, HybridQuery, IndexDoc, ScalarFilter};
 use napi::bindgen_prelude::*;
@@ -89,6 +90,42 @@ pub struct JsOpenOptions {
     /// Dimension of vectors accepted by the semantic index (default 384).
     /// Fixed at first open; reopening with a different value is an error.
     pub vector_dimension: Option<u32>,
+}
+
+#[napi(object)]
+pub struct JsDocEntry {
+    pub id: String,
+    /// Monotonic per-document version, starting at 1 on first put.
+    pub version: i64,
+    /// The stored document as a JSON string.
+    pub json: String,
+}
+
+#[napi(object)]
+pub struct JsPutOptions {
+    /// Optimistic concurrency: current version must equal this value
+    /// (0 = the document must not exist yet). Omit for unconditional upsert.
+    pub expected_version: Option<i64>,
+}
+
+#[napi(object)]
+pub struct JsScanOptions {
+    pub prefix: Option<String>,
+    pub start: Option<String>,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+    pub reverse: Option<bool>,
+}
+
+#[napi(object)]
+pub struct JsColOp {
+    /// "put" | "delete"
+    pub op: String,
+    pub collection: String,
+    pub id: String,
+    /// JSON document (required for "put").
+    pub json: Option<String>,
+    pub expected_version: Option<i64>,
 }
 
 #[napi(object)]
@@ -302,6 +339,36 @@ fn js_to_event_pattern(pattern: JsEventPattern) -> Result<EventPattern> {
     })
 }
 
+fn doc_entry_to_js(entry: DocEntry) -> JsDocEntry {
+    JsDocEntry {
+        id: entry.id,
+        version: entry.version as i64,
+        json: entry.doc.to_string(),
+    }
+}
+
+fn js_to_scan_options(options: Option<JsScanOptions>) -> ScanOptions {
+    let options = options.unwrap_or(JsScanOptions {
+        prefix: None,
+        start: None,
+        limit: None,
+        offset: None,
+        reverse: None,
+    });
+    ScanOptions {
+        prefix: options.prefix,
+        start: options.start,
+        limit: options.limit.unwrap_or(0) as usize,
+        offset: options.offset.unwrap_or(0) as usize,
+        reverse: options.reverse.unwrap_or(false),
+    }
+}
+
+fn parse_json_doc(json: &str) -> Result<serde_json::Value> {
+    serde_json::from_str(json)
+        .map_err(|e| Error::from_reason(format!("invalid document JSON: {e}")))
+}
+
 #[napi]
 pub struct JsHiveDB {
     inner: Mutex<Option<Arc<HiveDB>>>,
@@ -453,6 +520,137 @@ impl JsHiveDB {
     #[napi]
     pub async fn clear_index(&self) -> Result<()> {
         self.with_db(|db| db.clear_index().map_err(js_err))
+    }
+
+    /// Insert or replace a JSON document in a collection. Returns the new
+    /// version (starts at 1).
+    #[napi]
+    pub async fn col_put(
+        &self,
+        collection: String,
+        id: String,
+        json: String,
+        options: Option<JsPutOptions>,
+    ) -> Result<i64> {
+        let doc = parse_json_doc(&json)?;
+        let put_options = PutOptions {
+            expected_version: options.and_then(|o| o.expected_version).map(|v| v as u64),
+        };
+        self.with_db(|db| {
+            db.col_put(&collection, &id, &doc, put_options)
+                .map_err(js_err)
+                .map(|v| v as i64)
+        })
+    }
+
+    /// Read a document by id.
+    #[napi]
+    pub async fn col_get(&self, collection: String, id: String) -> Result<Option<JsDocEntry>> {
+        self.with_db(|db| {
+            Ok(db
+                .col_get(&collection, &id)
+                .map_err(js_err)?
+                .map(doc_entry_to_js))
+        })
+    }
+
+    /// Delete a document. Returns true if it existed.
+    #[napi]
+    pub async fn col_delete(&self, collection: String, id: String) -> Result<bool> {
+        self.with_db(|db| db.col_delete(&collection, &id).map_err(js_err))
+    }
+
+    /// Scan a collection in id order.
+    #[napi]
+    pub async fn col_scan(
+        &self,
+        collection: String,
+        options: Option<JsScanOptions>,
+    ) -> Result<Vec<JsDocEntry>> {
+        let scan = js_to_scan_options(options);
+        self.with_db(|db| {
+            Ok(db
+                .col_scan(&collection, &scan)
+                .map_err(js_err)?
+                .into_iter()
+                .map(doc_entry_to_js)
+                .collect())
+        })
+    }
+
+    /// Number of documents in a collection.
+    #[napi]
+    pub async fn col_count(&self, collection: String) -> Result<i64> {
+        self.with_db(|db| db.col_count(&collection).map_err(js_err).map(|c| c as i64))
+    }
+
+    /// Create an equality index on a top-level field (optionally unique).
+    /// Backfills existing documents; idempotent for an identical definition.
+    #[napi]
+    pub async fn col_create_index(
+        &self,
+        collection: String,
+        field: String,
+        unique: bool,
+    ) -> Result<()> {
+        self.with_db(|db| {
+            db.col_create_index(&collection, &field, unique)
+                .map_err(js_err)
+        })
+    }
+
+    /// Look up documents whose indexed field equals the given JSON scalar
+    /// (e.g. `"\"abc\""`, `"42"`, `"true"`). Requires colCreateIndex first.
+    #[napi]
+    pub async fn col_find_by(
+        &self,
+        collection: String,
+        field: String,
+        value_json: String,
+        options: Option<JsScanOptions>,
+    ) -> Result<Vec<JsDocEntry>> {
+        let value = parse_json_doc(&value_json)?;
+        let scan = js_to_scan_options(options);
+        self.with_db(|db| {
+            Ok(db
+                .col_find_by(&collection, &field, &value, &scan)
+                .map_err(js_err)?
+                .into_iter()
+                .map(doc_entry_to_js)
+                .collect())
+        })
+    }
+
+    /// Apply several puts/deletes atomically: either every operation commits
+    /// or none does.
+    #[napi]
+    pub async fn col_batch(&self, ops: Vec<JsColOp>) -> Result<()> {
+        let mut parsed: Vec<ColOp> = Vec::with_capacity(ops.len());
+        for op in ops {
+            match op.op.as_str() {
+                "put" => {
+                    let json = op
+                        .json
+                        .ok_or_else(|| Error::from_reason("batch put requires the json field"))?;
+                    parsed.push(ColOp::Put {
+                        collection: op.collection,
+                        id: op.id,
+                        doc: parse_json_doc(&json)?,
+                        expected_version: op.expected_version.map(|v| v as u64),
+                    });
+                }
+                "delete" => parsed.push(ColOp::Delete {
+                    collection: op.collection,
+                    id: op.id,
+                }),
+                other => {
+                    return Err(Error::from_reason(format!(
+                        "unknown batch op: {other} (expected \"put\" or \"delete\")"
+                    )));
+                }
+            }
+        }
+        self.with_db(|db| db.col_batch(&parsed).map_err(js_err))
     }
 
     #[napi]
