@@ -101,6 +101,75 @@ describe("G8 napi-rs binding", () => {
     expect(received[0].kindTag).toBe("Fact");
   });
 
+  it("§4.11e subscription filters by payload equality", async () => {
+    const stream = db.events({
+      kind: "Fact",
+      predicate: { kind: "Eq", path: "/temperature", value: 21.5 },
+    });
+
+    const received: any[] = [];
+    const consumer = (async () => {
+      for await (const event of stream) {
+        received.push(event);
+        if (received.length === 1) break;
+      }
+    })();
+
+    await db.append({
+      agentId: "agent-1",
+      streamId: "stream-1",
+      kind: "Fact",
+      payload: JSON.stringify({ temperature: 22.0, room: "B" }),
+    });
+    await db.append({
+      agentId: "agent-1",
+      streamId: "stream-1",
+      kind: "Fact",
+      payload: JSON.stringify({ temperature: 21.5, room: "A" }),
+    });
+
+    await consumer;
+    stream.close();
+
+    expect(received.length).toBe(1);
+    expect(JSON.parse(received[0].payload).temperature).toBe(21.5);
+    expect(JSON.parse(received[0].payload).room).toBe("A");
+  });
+
+  it("§4.11f subscription filters by payload contains", async () => {
+    const stream = db.events({
+      kind: "Fact",
+      predicate: { kind: "Contains", path: "/tags", value: "urgent" },
+    });
+
+    const received: any[] = [];
+    const consumer = (async () => {
+      for await (const event of stream) {
+        received.push(event);
+        if (received.length === 1) break;
+      }
+    })();
+
+    await db.append({
+      agentId: "agent-1",
+      streamId: "stream-1",
+      kind: "Fact",
+      payload: JSON.stringify({ tags: ["home"], room: "B" }),
+    });
+    await db.append({
+      agentId: "agent-1",
+      streamId: "stream-1",
+      kind: "Fact",
+      payload: JSON.stringify({ tags: ["urgent", "home"], room: "A" }),
+    });
+
+    await consumer;
+    stream.close();
+
+    expect(received.length).toBe(1);
+    expect(JSON.parse(received[0].payload).room).toBe("A");
+  });
+
   it("§4.12 upserts text-only docs and searches with Spanish morphology", async () => {
     await db.upsertBatch([
       {
@@ -220,6 +289,37 @@ describe("G8 napi-rs binding", () => {
     } finally {
       rmSync(dir2, { recursive: true, force: true });
     }
+  });
+
+  it("§4.13 exposes lastSeq and toolStats", async () => {
+    const seq1 = await db.append({
+      agentId: "agent-1",
+      streamId: "stream-1",
+      kind: "ToolCall",
+      payload: JSON.stringify({ tool: "search", latency_ms: 10, cost: 0.5, outcome: "Ok" }),
+    });
+    expect(await db.lastSeq()).toBe(seq1);
+
+    await db.append({
+      agentId: "agent-1",
+      streamId: "stream-1",
+      kind: "ToolCall",
+      payload: JSON.stringify({
+        tool: "search",
+        latency_ms: 20,
+        cost: 0.7,
+        outcome: { Err: "rate limited" },
+      }),
+    });
+
+    const stats = await db.toolStats("search");
+    expect(stats).toBeDefined();
+    expect(stats!.invocations).toBe(2);
+    expect(stats!.errors).toBe(1);
+    expect(stats!.totalLatencyMs).toBe(30);
+    expect(stats!.totalCost).toBeCloseTo(1.2, 6);
+    expect(stats!.lastOutcome).toBe("Err: rate limited");
+    expect(stats!.lastSeq).toBe(2);
   });
 
   it("§4.11d 150 open/append/close cycles stay within 30 MB RSS growth", async () => {
