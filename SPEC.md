@@ -1,6 +1,7 @@
 # HiveDB — Especificación del Motor
 
-> Motor de base de datos embebido, local-first, agent-native para el ecosistema Hive.
+> Motor de base de datos embebido, local-first, agent-native — pensado para ser el motor de
+> memoria/persistencia de cualquier runtime de agentes; hoy usado por el ecosistema Hive.
 > **Lenguaje:** Rust 1.95 (edición 2024) · **Runtime consumidor:** Bun (Rust) vía napi-rs
 > **Licencia objetivo:** Apache-2.0 · **Estado:** spec v0.1 (pre-implementación)
 
@@ -112,8 +113,21 @@ enum EventKind {
     ConsentGranted  { from: AgentId, to: AgentId, scope: Scope, expires: Option<u64> },
     ConsentRevoked  { grant_seq: u64 },
     IntentLogged    { actor: AgentId, intent: String, authorized_by: Option<u64> },
+
+    // Harness de larga duración (ver §9)
+    LearningProposal, // proposal del HarnessLoop persistida para auditoría; el harness nunca la relee
 }
 ```
+
+> **Shape canónico de `ToolCall.payload.outcome`** (implementación actual): el
+> `outcome` vive en el payload JSON del evento, no como campo tipado aparte, y
+> debe ser uno de `"Ok"` / `"Timeout"` / `{"Err": "<mensaje>"}` — parseado por
+> `parse_tool_outcome` (`state/causal_thread.rs`), la única fuente de verdad
+> que usan tanto `ToolLedger` como `CausalThread`. Cualquier otro shape
+> (por ejemplo strings sueltos como `"ok"`/`"error"`) cae en el default
+> `Ok`, así que un fallo emitido con el shape equivocado se pierde en
+> silencio. Ver `docs/AGENT_INTEGRATION.md` para el contrato completo de
+> eventos.
 
 ### 2.3 Payload schema-flex tipado en los bordes
 
@@ -146,8 +160,8 @@ trait Projection {
 |---|---|
 | `CurrentFacts` | hechos vigentes (no invalidados) por agente/stream |
 | `TaskState` | estado actual de cada `stream_id` |
-| `ToolLedger` | agregados de uso de herramientas (latencia, costo, error-rate) |
-| `ConsentGraph` | grafo de delegaciones activas (ver §6) |
+| `ToolLedger` | agregados de uso de herramientas (latencia, costo, error-rate); scope `Agent` con merge cross-shard |
+| `ConsentGraph` | grafo de delegaciones activas (ver §6); scope `Global` |
 
 ---
 
@@ -224,8 +238,8 @@ Grafo embebido que responde: *¿quién autorizó qué, a qué agente, y sigue vi
 
 - Nodos: `AgentId`. Aristas: grants (`ConsentGranted`) con `scope` y `expires`.
 - Derivado de eventos `ConsentGranted`/`ConsentRevoked` vía la proyección `ConsentGraph`.
-- API: `can(agent, action, resource) -> Decision` resuelta por traversal del grafo vigente.
-- Cada decisión de autorización emite un `IntentLogged` con `authorized_by` apuntando al `seq` del grant usado → cadena de auditoría completa y reproducible.
+- API: `can(agent, action, resource) -> Decision` resuelta por traversal del grafo vigente. El traversal es transitivo: `PM → Lead → Backend` autoriza a `Backend` si todos los eslabones son vigentes. Se detectan ciclos para evitar loops infinitos.
+- Cada decisión de autorización emite un `IntentLogged` con `authorized_by` apuntando al `seq` del **grant directo** que cierra la cadena (el más cercano al solicitante) → cadena de auditoría completa y reproducible.
 
 Esto materializa directamente la línea de *delegated consent / intent audit logs* del trabajo de gobernanza.
 
@@ -245,6 +259,12 @@ struct EventPattern {
     stream_id:Option<StreamId>,
     predicate:Option<Predicate>, // filtro sobre payload
 }
+
+enum Predicate {
+    Always,
+    Eq { path: String, value: Value },       // igualdad en ruta JSON pointer
+    Contains { path: String, value: Value }, // array contiene valor, o string contiene subcadena
+}
 ```
 
 - Al hacer `append`, el motor evalúa suscripciones activas y empuja a los matches.
@@ -262,7 +282,45 @@ struct EventPattern {
 
 ---
 
-## 9. API pública (capa TS sobre napi-rs)
+## 9. Harness de larga duración (memoria causal + evaluación de proceso)
+
+Primitivo del motor, no de la app (principio de diseño #4, §0): la memoria causal, la
+construcción de contexto y la evaluación de proceso para tareas de agentes de larga duración
+viven en `hivedb-core`, no se reimplementan por cada runtime que consume el motor. Este
+harness es **agnóstico del consumidor** — no asume ningún concepto de aplicación específica
+(sesión de chat, cola de jobs, checkpoint/lease de proceso); solo interpreta el event-log
+genérico según el contrato de eventos descrito abajo. Ver `docs/AGENT_INTEGRATION.md` para el
+contrato completo (vocabulario MUST/SHOULD/MAY) que cualquier runtime debe cumplir para
+obtener valor de estos primitivos.
+
+Tres piezas, todas puras (sin I/O más allá de leer el log/índice):
+
+- **`CausalThread`** (`causal/mod.rs`): reconstruye, para un `stream_id`, el grafo de
+  decisiones (`StateTransition`) y llamadas a herramientas (`ToolCall`) siguiendo los enlaces
+  `causation`. Detecta dos anomalías: `ErrorLoop` (misma herramienta con el mismo error ≥ 3
+  veces) y `ObjectiveDrift` (decisiones cuya `correlation` difiere del `IntentLogged` inicial
+  del stream). Se reconstruye bajo demanda desde el log completo — ver la nota de
+  escalabilidad en `docs/IMPLEMENTATION.md` §9.
+- **`build_agent_context`** (`context.rs`): ventana de contexto acotada en tokens para un
+  prompt de LLM, con estrategias configurables (`causal_anchors`, `compress_completed_phases`,
+  `episodic_similarity` sobre el índice híbrido, `recent_anomalies`). Nunca excede el
+  presupuesto de tokens solicitado; `content_hash()` permite chequeos de idempotencia.
+- **`HarnessLoop::evaluate`** (`harness.rs`): evaluador puro que recibe un `CausalThread` (más
+  episodios similares opcionales) y produce `process_quality`, `output_quality`, `root_cause`
+  (decisión más temprana en la cadena de fallos), `findings` y `proposals`
+  (`LearningProposal` con `evidence_seqs`/`confidence`/`specificity`). No tiene side effects —
+  el llamador decide si persiste las proposals como eventos `LearningProposal` para auditoría.
+
+**Contrato de payload que estas piezas asumen** (ver también §2.3): `StateTransition.payload`
+lleva `description` (string) y opcionalmente `phase`; `ToolCall.payload` lleva `outcome` en el
+shape canónico `"Ok"` / `"Timeout"` / `{"Err": "<mensaje>"}` (documentado en §2.2) y
+opcionalmente `latency_ms`/`cost`; `IntentLogged.correlation` es el ancla contra la que se mide
+`ObjectiveDrift`. Un consumidor que no siga este contrato simplemente no obtiene esas señales —
+no hay fallos silenciosos más allá del ya corregido bug de shape de `outcome` (§2.2).
+
+---
+
+## 10. API pública (capa TS sobre napi-rs)
 
 ```typescript
 import { HiveDB } from "@johpaz/hive-db";
@@ -288,13 +346,22 @@ const hits = await db.queryHybrid({
   k: 10,
 });
 
-// Suscripción reactiva (push, no polling)
-for await (const ev of db.events({ kind: "ToolCall" })) {
+// Suscripción reactiva con filtro por payload (push, no polling)
+for await (const ev of db.events({
+  kind: "Fact",
+  predicate: { kind: "Eq", path: "/severity", value: "critical" },
+})) {
   // despertado por el motor
 }
 
 // Consentimiento
 const decision = await db.can("FrontendEngineer", "deploy", "prod");
+
+// Métricas de herramientas
+const stats = await db.toolStats("web_search");
+
+// Último seq asignado
+const last = await db.lastSeq();
 
 // Colecciones de documentos (CRUD mutable, versionado optimista)
 const agents = db.collection<{ name: string; role: string }>("agents");
@@ -310,23 +377,25 @@ await db.batch([
 
 ---
 
-## 10. Layout en disco (soberanía: todo local, un directorio)
+## 11. Layout en disco (soberanía: todo local, un directorio)
 
 ```
 ./hive-data/
-├── log.redb           # event-log append-only + proyecciones (redb)
-├── collections.redb   # colecciones de documentos: docs, índices secundarios, defs
-├── fts/               # índice tantivy (BM25)
-├── vec/               # índice hnsw_rs (ANN)
-├── snapshots/         # snapshots opcionales de working memory
-└── MANIFEST           # versión de esquema, checkpoints, metadata
+├── shards/
+│   ├── <agent_id>.redb  # event-log append-only + proyecciones por agente
+│   └── _global.redb     # proyecciones globales + tabla meta (next_seq)
+├── collections.redb     # colecciones de documentos: docs, índices secundarios, defs
+├── fts/                 # índice tantivy (BM25)
+├── vec/                 # índice hnsw_rs (ANN)
+├── meta.json            # dimensión vectorial y settings inmutables
+└── snapshots/           # snapshots opcionales de working memory
 ```
 
 Backup = copiar el directorio. Sync futuro (Hive Cloud) = protocolo CRDT-friendly sobre el log, eventual-consistency sin reescribir el modelo.
 
 ---
 
-## 11. Estructura del repositorio (monorepo)
+## 12. Estructura del repositorio (monorepo)
 
 ```
 hivedb/
@@ -356,19 +425,27 @@ hivedb/
 
 ---
 
-## 12. Roadmap de implementación (orden TDD-first)
+## 13. Roadmap de implementación (orden TDD-first)
 
 | Fase | Entregable | Gate (tests verdes) |
 |---|---|---|
 | 0 | Esqueleto workspace + CI | compila, `cargo test` corre vacío |
-| 1 | Event + Log append-only sobre redb | §4.1, §4.2 |
-| 2 | Proyecciones + replay determinista | §4.3, §4.4 |
-| 3 | Working memory (TTL) | §4.5 |
+| 1 | Event + Log append-only sobre redb; persistencia de `next_seq` | §4.1, §4.2 |
+| 2 | Proyecciones + replay determinista; `ToolLedger` | §4.3, §4.4 |
+| 3 | Working memory (TTL) + binding TS | §4.5 |
 | 4 | Semantic (tantivy + hnsw + RRF) | §4.6, §4.7 |
-| 5 | Reactive engine | §4.8 |
-| 6 | Consent graph | §4.9 |
-| 7 | Concurrencia particionada | §4.10 |
-| 8 | napi-rs binding + capa TS | §4.11 |
-| 9 | Crash-safety / recovery | §4.4 (fuzz) |
+| 5 | Reactive engine con predicados de payload | §4.8 |
+| 6 | Consent graph transitivo | §4.9 |
+| 7 | Concurrencia particionada; `loom` fuera de builds de producción | §4.10 |
+| 8 | napi-rs binding + capa TS (working memory, suscripciones con predicados, `toolStats`, `lastSeq`) | §4.11 |
+| 9 (G9) | Harness de larga duración: `CausalThread`, `buildAgentContext`, `HarnessLoop` (§9) | TDD §5.1-§5.4 |
+| 10 (G10) | Distribución multiplataforma con `@napi-rs/cli` (6 targets) | CI de release |
+| 11 (G11) | Colecciones de documentos: CRUD versionado, índices secundarios, batches atómicos | §4.4 (colecciones) |
 
 Cada fase: **rojo → verde → refactor.** No se pasa de fase sin el gate verde.
+
+> Nota de numeración: esta tabla usa "Fase N" desde el diseño original; los docs más nuevos
+> (`README.md`, `TDD.md`, `AGENTS.md`) llaman a las mismas fases "Gate GN" — son la misma
+> secuencia, solo con dos nombres por evolución del proyecto. `TDD.md` también numera los tests
+> de colecciones como `g9_collections.rs` por una colisión histórica; el gate funcional de
+> colecciones es G11, no G9 (ver nota en `README.md`).

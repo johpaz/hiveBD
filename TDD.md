@@ -44,6 +44,39 @@ fn client_cannot_set_seq_or_timestamp() {
 }
 ```
 
+### §4.1c — `next_seq` sobrevive a reaperturas sin escanear
+```rust
+#[test]
+fn next_seq_survives_reopen_without_rescan() {
+    let dir = tempdir().unwrap();
+    let db = HiveDB::open(dir.path()).unwrap();
+    let s1 = db.append(event("A", Fact, payload())).unwrap();
+    drop(db);
+
+    let db2 = HiveDB::open(dir.path()).unwrap();
+    let s2 = db2.append(event("A", Fact, payload())).unwrap();
+
+    assert_eq!(s2, s1 + 1);
+}
+```
+
+### §4.1d — reapertura sin meta cae al escaneo de shards
+```rust
+#[test]
+fn reopen_without_meta_falls_back_to_scan() {
+    let dir = tempdir().unwrap();
+    {
+        let db = HiveDB::open(dir.path()).unwrap();
+        db.append(event("A", Fact, payload())).unwrap();
+    }
+    // Simula base antigua sin clave "next_seq" en `_global.redb`.
+    // ...
+    let db = HiveDB::open(dir.path()).unwrap();
+    let seq = db.append(event("A", Fact, payload())).unwrap();
+    assert_eq!(seq, 2);
+}
+```
+
 ### §4.2 — el log es append-only: no hay update ni delete
 ```rust
 #[test]
@@ -149,6 +182,38 @@ proptest! {
 }
 ```
 
+### §4.4c — `ToolLedger` agrega métricas de invocaciones
+```rust
+#[test]
+fn tool_ledger_aggregates_invocations() {
+    let db = HiveDB::open_temp();
+    for _ in 0..3 {
+        db.append(tool_call("search", json!({"latency_ms": 10, "cost": 0.5, "outcome": "Ok"}))).unwrap();
+    }
+    let stats = db.tool_stats("search").unwrap().unwrap();
+    assert_eq!(stats.invocations, 3);
+    assert_eq!(stats.total_latency_ms, 30);
+}
+```
+
+### §4.4d — `ToolLedger` cuenta errores y sobrevive a wipe+replay
+```rust
+#[test]
+fn tool_ledger_counts_errors_and_survives_replay() {
+    let db = HiveDB::open_temp();
+    db.append(tool_call("email", json!({"latency_ms": 8, "cost": 0.1, "outcome": "Ok"}))).unwrap();
+    db.append(tool_call("email", json!({"latency_ms": 12, "cost": 0.1, "outcome": {"Err": "smtp rejected"}}))).unwrap();
+
+    let stats = db.tool_stats("email").unwrap().unwrap();
+    assert_eq!(stats.invocations, 2);
+    assert_eq!(stats.errors, 1);
+
+    db.wipe_projections_and_rebuild().unwrap();
+    let stats2 = db.tool_stats("email").unwrap().unwrap();
+    assert_eq!(stats2, stats);
+}
+```
+
 ---
 
 ## Fase 3 — Working memory (TTL)
@@ -181,6 +246,21 @@ fn working_memory_concurrent_writes_no_corruption() {
     for h in handles { h.join().unwrap(); }
     assert_eq!(db.working_keys("A").len(), 16 * 1000); // nada perdido, nada duplicado
 }
+```
+
+### §4.5c — working memory está disponible desde Bun/TypeScript
+```typescript
+test("§4.5c working memory round-trips, expires by TTL, and is isolated by agent", async () => {
+  const db = await HiveDB.open(tmpDir());
+  await db.workingSet("agent-a", "draft", { text: "hello" });
+  expect(await db.workingGet("agent-a", "draft")).toEqual({ text: "hello" });
+  await db.workingSet("agent-a", "temp", 42, 50);
+  expect(await db.workingGet<number>("agent-a", "temp")).toBe(42);
+  await new Promise((r) => setTimeout(r, 100));
+  expect(await db.workingGet<number>("agent-a", "temp")).toBeUndefined();
+  await db.workingSet("agent-b", "k1", 2);
+  expect(await db.workingKeys("agent-a")).toEqual(["draft"]);
+});
 ```
 
 ---
@@ -273,6 +353,46 @@ async fn subscription_delivers_at_least_once_with_seq() {
 }
 ```
 
+### §4.8c — suscripción filtra por igualdad de payload
+```rust
+#[tokio::test]
+async fn subscription_filters_by_payload_equality() {
+    let db = HiveDB::open_temp();
+    let mut sub = db.subscribe(EventPattern {
+        kind: Some(EventKindTag::Fact),
+        predicate: Some(Predicate::Eq {
+            path: "/temperature".into(),
+            value: json!(21.5),
+        }),
+        ..Default::default()
+    });
+    db.append(event_with_payload("A", Fact, json!({"temperature": 22.0}))).unwrap();
+    db.append(event_with_payload("A", Fact, json!({"temperature": 21.5}))).unwrap();
+    let ev = timeout(Duration::from_millis(500), sub.next()).await.unwrap().unwrap();
+    assert_eq!(ev.payload["temperature"], 21.5);
+}
+```
+
+### §4.8d — suscripción filtra por contención en payload
+```rust
+#[tokio::test]
+async fn subscription_filters_by_payload_contains() {
+    let db = HiveDB::open_temp();
+    let mut sub = db.subscribe(EventPattern {
+        kind: Some(EventKindTag::Fact),
+        predicate: Some(Predicate::Contains {
+            path: "/tags".into(),
+            value: json!("urgent"),
+        }),
+        ..Default::default()
+    });
+    db.append(event_with_payload("A", Fact, json!({"tags": ["home"]}))).unwrap();
+    db.append(event_with_payload("A", Fact, json!({"tags": ["urgent", "home"]}))).unwrap();
+    let ev = timeout(Duration::from_millis(500), sub.next()).await.unwrap().unwrap();
+    assert_eq!(ev.payload["tags"], json!(["urgent", "home"]));
+}
+```
+
 ---
 
 ## Fase 6 — Consent graph
@@ -325,6 +445,47 @@ fn expired_consent_does_not_authorize() {
     db.append(consent_granted("PM","Backend",scope("deploy","staging"), Some(1500))).unwrap();
     db.advance_clock_to(2000); // pasó el expiry
     assert!(!db.can("Backend","deploy","staging").allowed());
+}
+```
+
+### §4.9e — consentimiento transitivo autoriza a través de una cadena
+```rust
+#[test]
+fn consent_transitive_authorization() {
+    let db = HiveDB::open_temp();
+    db.append(consent_granted("PM", "Lead", scope("deploy", "staging"), None)).unwrap();
+    let lead_to_backend = db.append(consent_granted("Lead", "Backend", scope("deploy", "staging"), None)).unwrap();
+
+    let decision = db.can("Backend", "deploy", "staging");
+    assert!(decision.allowed());
+    let intent = db.read(decision.intent_log_seq().unwrap()).unwrap();
+    assert_eq!(intent.authorized_by(), Some(lead_to_backend)); // grant directo
+}
+```
+
+### §4.9f — ciclo en el grafo no loopdea infinitamente
+```rust
+#[test]
+fn consent_cycle_does_not_loop_forever() {
+    let db = HiveDB::open_temp();
+    db.append(consent_granted("PM", "Lead", scope("deploy", "staging"), None)).unwrap();
+    db.append(consent_granted("Lead", "Backend", scope("deploy", "staging"), None)).unwrap();
+    db.append(consent_granted("Backend", "PM", scope("deploy", "staging"), None)).unwrap();
+
+    // Termina sin colgar; un ciclo puro no tiene root, así que no autoriza.
+    assert!(!db.can("Backend", "deploy", "staging").allowed());
+}
+```
+
+### §4.9g — expiración en cualquier eslabón rompe la cadena
+```rust
+#[test]
+fn transitive_consent_honors_expiration_on_any_link() {
+    let db = HiveDB::open_temp_with_clock(MockClock::at(1000));
+    db.append(consent_granted("PM", "Lead", scope("deploy", "staging"), Some(1500))).unwrap();
+    db.append(consent_granted("Lead", "Backend", scope("deploy", "staging"), None)).unwrap();
+    db.advance_clock_to(2000);
+    assert!(!db.can("Backend", "deploy", "staging").allowed());
 }
 ```
 
@@ -433,6 +594,39 @@ test("§4.11d repeated open/close does not leak native memory", async () => {
 });
 ```
 
+### §4.13 — `lastSeq()` y `toolStats(tool)` desde Bun
+```typescript
+test("§4.13 exposes lastSeq and toolStats", async () => {
+  const db = await HiveDB.open(tmpDir());
+  const seq1 = await db.append({
+    agentId: "A",
+    streamId: "task-1",
+    kind: "ToolCall",
+    payload: JSON.stringify({ tool: "search", latency_ms: 10, cost: 0.5, outcome: "Ok" }),
+  });
+  expect(await db.lastSeq()).toBe(seq1);
+
+  await db.append({
+    agentId: "A",
+    streamId: "task-1",
+    kind: "ToolCall",
+    payload: JSON.stringify({
+      tool: "search",
+      latency_ms: 20,
+      cost: 0.7,
+      outcome: { Err: "rate limited" },
+    }),
+  });
+
+  const stats = await db.toolStats("search");
+  expect(stats).toBeDefined();
+  expect(stats!.invocations).toBe(2);
+  expect(stats!.errors).toBe(1);
+  expect(stats!.totalLatencyMs).toBe(30);
+  expect(stats!.lastOutcome).toBe("Err: rate limited");
+});
+```
+
 ---
 
 ## Dependencias de test (Cargo)
@@ -441,9 +635,12 @@ test("§4.11d repeated open/close does not leak native memory", async () => {
 [dev-dependencies]
 proptest   = "1"        # property-based: invariantes (replay, determinismo)
 trybuild   = "1"        # compile-fail: contrato de API (no seq/timestamp del cliente)
-loom       = "0.7"      # model checker de concurrencia (camino de escritura)
 tokio      = { version = "1", features = ["macros", "rt", "time"] }
 tempfile   = "3"
+
+# `loom` se declara como dependencia condicional para no entrar en builds de producción:
+# [target.'cfg(loom)'.dependencies]
+# loom = "0.7"
 ```
 
 ## Comandos
@@ -467,14 +664,14 @@ Cada fase del roadmap del SPEC tiene un gate. CI no permite merge a `main` sin e
 
 | Gate | Tests que deben pasar |
 |---|---|
-| G1 Log | §4.1, §4.1b, §4.2, §4.2b |
-| G2 Proyecciones | §4.3, §4.3b, §4.4, §4.4b |
-| G3 Working | §4.5, §4.5b |
+| G1 Log | §4.1, §4.1b, §4.1c, §4.1d, §4.2, §4.2b |
+| G2 Proyecciones | §4.3, §4.3b, §4.4, §4.4b, §4.4c, §4.4d |
+| G3 Working | §4.5, §4.5b, §4.5c |
 | G4 Semantic | §4.6, §4.6b, §4.7 |
-| G5 Reactive | §4.8, §4.8b |
-| G6 Consent | §4.9, §4.9b, §4.9c, §4.9d |
+| G5 Reactive | §4.8, §4.8b, §4.8c, §4.8d |
+| G6 Consent | §4.9, §4.9b, §4.9c, §4.9d, §4.9e, §4.9f, §4.9g |
 | G7 Concurrencia | §4.10, §4.10b, §4.10c |
-| G8 Bun/FFI | §4.11, §4.11b, §4.11c, §4.11d |
+| G8 Bun/FFI | §4.11, §4.11b, §4.11c, §4.11d, §4.13 |
 
 **Orden de ataque recomendado:** G1 → G2 son el corazón (event sourcing). Si esos dos están sólidos y con replay determinista probado por property test, el resto se construye encima con confianza. No optimices nada hasta que G1+G2 estén verdes y refactorizados.
 
@@ -482,7 +679,9 @@ Cada fase del roadmap del SPEC tiene un gate. CI no permite merge a `main` sin e
 
 ## Fase 9 — Harness con contexto real para larga duración
 
-> Esta fase es el puente entre el motor (G1-G8) y el swarm de agentes (hiveCode).
+> Esta fase es el puente entre el motor (G1-G8) y cualquier runtime de agentes que consuma
+> HiveDB. hiveCode es el primer consumidor de referencia — ver `docs/AGENT_INTEGRATION.md`
+> para el contrato de eventos que cualquier otro runtime debe cumplir.
 > Cubre tres componentes: `CausalThread` (proyección causal), `buildAgentContext`
 > (ventana adaptativa para el LLM), y `HarnessLoop` (evaluador con contexto causal real).
 > Gate G9 — ninguno de estos tests puede pasar antes de que G1+G2 estén verdes.
@@ -952,7 +1151,7 @@ async fn long_running_task_resumes_with_full_causal_context() {
 #### §5.4b — el harness mejora entre tareas: la segunda tarea produce menos proposals
 ```rust
 #[test]
-fn harness_loop_improves_swarm_across_tasks() {
+fn harness_loop_improves_across_similar_tasks() {
     let db = HiveDB::open_temp();
 
     // Primera tarea: varios fallos, genera proposals
@@ -964,7 +1163,7 @@ fn harness_loop_improves_swarm_across_tasks() {
     // Aprobamos y aplicamos las proposals
     for p in &eval1.proposals { db.append(learning_proposal_approved(p)).unwrap(); }
 
-    // Segunda tarea del mismo tipo: el swarm aprendió
+    // Segunda tarea del mismo tipo: el runtime consumidor aprendió
     let t2 = seed_similar_task(&db, "task-2", t1);
     let eval2 = HarnessLoop::evaluate(HarnessInput {
         causal_thread: db.causal_thread(t2).unwrap(),
@@ -974,7 +1173,7 @@ fn harness_loop_improves_swarm_across_tasks() {
 
     // Después de aplicar el aprendizaje, la segunda tarea tiene menos anomalías
     assert!(eval2.anomaly_count() < eval1.anomaly_count());
-    // Y las proposals son más específicas (el swarm sabe qué falló antes)
+    // Y las proposals son más específicas (ya sabe qué falló antes)
     if !eval2.proposals.is_empty() {
         assert!(eval2.proposals[0].confidence > eval1.proposals[0].confidence);
     }

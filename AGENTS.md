@@ -43,13 +43,14 @@ crates/hivedb-core/src/
 ├── projection.rs     # trait Projection, ProjectionStore, registry
 ├── reactive.rs       # motor reactivo con tokio mpsc
 ├── shard.rs          # AgentShard (un redb por agente)
-└── state/            # proyecciones: consent_graph, current_facts, task_state
+└── state/            # proyecciones: consent_graph, current_facts, task_state, tool_ledger
 
 crates/hivedb-core/tests/
 ├── common/           # helpers compartidos
 ├── compile_fail.rs   # tests de API (trybuild)
 ├── g1_log.rs
 ├── g2_projections.rs
+├── g2_tool_ledger.rs
 ├── g3_working.rs
 ├── g4_semantic.rs
 ├── g5_reactive.rs
@@ -64,17 +65,18 @@ crates/hivedb-core/tests/
 - **Tests:** cada gate añade su archivo `gN_*.rs` y se registra en `Cargo.toml`.
 - **Reloj:** todo tiempo pasa por `Clock`. Nunca uses `SystemTime::now()` directamente en lógica de negocio.
 - **Proyecciones:**
-  - Locales (`CurrentFacts`, `TaskState`): viven en cada shard; `project()` mergea estados parciales.
+  - Locales (`CurrentFacts`, `TaskState`, `ToolLedger`): viven en cada shard; `project()` mergea estados parciales.
   - Globales (`ConsentGraph`): viven en `_global.redb`; implementar `Projection::scope() -> ProjectionScope::Global`.
 - **Concurrencia:** desde G7, cada `agent_id` escribe en su propio shard `redb`; el `seq` global es `AtomicU64`.
-- **Distribución (G9):** el binario nativo se construye y publica con `@napi-rs/cli` 3.x. Ver `docs/DISTRIBUTION.md` y `docs/IMPLEMENTATION.md` §13. Los scripts `napi` viven en `packages/hive-db/package.json`.
+- **Harness de larga duración (G9):** `CausalThread`, `build_agent_context` y `HarnessLoop` viven en `hivedb-core`. Es agnóstico del consumidor — ver `docs/AGENT_INTEGRATION.md` para el contrato de eventos que cualquier runtime de agentes debe cumplir, `SPEC.md` §9 para la arquitectura, TDD §5.1-§5.4 para el contrato de tests y `docs/IMPLEMENTATION.md` §9 para el detalle de implementación.
+- **Distribución (G10):** el binario nativo se construye y publica con `@napi-rs/cli` 3.x. Ver `docs/DISTRIBUTION.md` y `docs/IMPLEMENTATION.md` §15. Los scripts `napi` viven en `packages/hive-db/package.json`.
 - **napi-rs:** el crate `hivedb-napi` usa napi 3.10.1 con features `napi8`, `async`, `tokio_rt`. El runtime de tokio se captura en `open()` y se reutiliza en `subscribe()` (método sync que lanza `self.runtime.spawn`).
 
 ## Decisiones arquitectónicas vigentes
 
 - Sharding por `agent_id` (un archivo `redb` por agente) para evitar el single-writer global de `redb`.
 - `ConsentGraph` se mantiene en un shard global separado `_global.redb`.
-- El contador `seq` no se persiste; se reconstruye al abrir escaneando shards (suficiente hasta G9).
+- El contador `seq` persiste en la tabla `meta` del shard global (`_global.redb`) bajo la clave `"next_seq"`, pero **solo en eventos globales** (`ConsentGranted`, `ConsentRevoked`, `IntentLogged`) y en el `Drop` de `HiveDB`. Los eventos normales de agente no tocan `_global.redb`, preservando el sharding por agente. Las reaperturas usan el valor persistido y caen al escaneo de shards si la clave no existe o está atrasada.
 - `HiveDB::open_in_memory()` no materializa proyecciones ni índice semántico; es solo para `loom`.
 
 ## Workarounds conocidos
@@ -84,9 +86,10 @@ crates/hivedb-core/tests/
 
 ## Puntos de extensión comunes
 
-- Nuevo `EventKind`: añadir variante en `event.rs`, `EventKindTag`, y manejar en proyecciones/reactive según corresponda.
+- Nuevo `EventKind`: añadir variante en `event.rs`, `EventKindTag`, y manejar en proyecciones/reactive/napi según corresponda. `LearningProposal` es el ejemplo añadido para G9.
 - Nueva proyección: implementar `Projection`, registrar en `default_registry()`, decidir `ProjectionScope`.
 - Nuevo gate de concurrencia: usar `DashMap`/mutex por shard; para `loom` usar `memory_log.rs`.
+- Nuevo análisis de harness: añadir variante en `causal::AnomalyKind`, detector en `causal/mod.rs`, y generador de proposal en `harness.rs`.
 
 ## Contacto / dudas
 

@@ -35,7 +35,7 @@ hiveBD/
 1. **El log es la fuente de verdad.** Todo estado es una proyección derivada.
 2. **Append-only.** Nunca se muta un evento existente.
 3. **Cliente no controla `seq` ni `timestamp`.** El motor los asigna para garantizar orden y auditoría.
-4. **Particionamiento por `agent_id`.** Cada agente tiene su propio shard `redb`; escrituras de distintos agentes no se bloquean.
+4. **Particionamiento por `agent_id`.** Cada agente tiene su propio shard `redb`; escrituras de distintos agentes no se bloquean. La persistencia de `next_seq` se hace dentro del shard global solo cuando un evento global ya lo toca (`ConsentGranted`, `ConsentRevoked`, `IntentLogged`) o en el `Drop` de `HiveDB`, para no introducir contención cruzada en cada append.
 5. **Determinismo puro.** Una proyección debe producir el mismo estado reproduciendo el log.
 
 ---
@@ -47,7 +47,7 @@ hiveBD/
 - Un directorio base contiene:
   - `shards/<agent_id>.redb` — un shard por agente.
   - `shards/_global.redb` — shard global para proyecciones y registro de consentimiento.
-- `next_seq` y `seq_to_agent` viven en memoria (protegidos por primitivas `loom`-safe en tests).
+- `next_seq` y `seq_to_agent` viven en memoria mientras la base está abierta. `next_seq` se persiste en la tabla `meta` de `_global.redb` bajo `"next_seq"`; `seq_to_agent` se reconstruye escaneando shards al abrir.
 
 ### Flujo de `append`
 
@@ -56,13 +56,14 @@ hiveBD/
 3. Se resuelve el shard del `agent_id` (o se crea).
 4. En una transacción `redb`:
    - Guarda el evento.
-   - Actualiza `seq_to_agent`.
-   - Aplica handlers de proyección (agente y global).
+   - Aplica handlers de proyección de agente.
+   - Si el evento afecta proyecciones globales, también aplica handlers en `_global.redb` y, en la misma sección crítica, persiste `next_seq` en la tabla `meta`.
 5. Se dispara el evento por el `ReactiveEngine`.
+6. Al cerrar la base (`Drop` de `HiveDB`), se hace un flush de `next_seq`.
 
 ### Tests de log
 
-Los tests de G1 viven en `crates/hivedb-core/tests/g1_log.rs` y verifican monotonía global, inmutabilidad y ausencia de API de mutación.
+Los tests de G1 viven en `crates/hivedb-core/tests/g1_log.rs` y verifican monotonía global, inmutabilidad, ausencia de API de mutación, y persistencia de `next_seq` tras reapertura (`next_seq_survives_reopen_without_rescan`) y fallback al escaneo cuando no hay meta (`reopen_without_meta_falls_back_to_scan`).
 
 ---
 
@@ -92,6 +93,7 @@ fn default_registry() -> ProjectionRegistry {
     registry.register::<CurrentFacts>();
     registry.register::<TaskState>();
     registry.register::<ConsentGraph>();
+    registry.register::<ToolLedger>();
     registry.register::<MiProyeccion>(); // <-- nuevo
     registry
 }
@@ -101,8 +103,8 @@ fn default_registry() -> ProjectionRegistry {
 
 ### Scope
 
-- `Agent`: se mantiene una copia del estado por shard de agente. Útil para hechos vigentes, tareas, etc.
-- `Global`: un único estado en `_global.redb`. Útil para consentimiento y métricas cross-agent.
+- `Agent`: se mantiene una copia del estado por shard de agente. Útil para hechos vigentes, tareas, métricas de herramientas, etc.
+- `Global`: un único estado en `_global.redb`. Útil para consentimiento.
 
 ### Merge
 
@@ -132,6 +134,7 @@ No expongas `seq` ni `timestamp` en `EventInput`. Hay un test `compile_fail` (`t
 - `ReactiveEngine` mantiene un `DashMap<u64, (EventPattern, UnboundedSender<Event>)>`.
 - `subscribe(pattern)` devuelve una `Subscription` con receptor `tokio::mpsc::unbounded`.
 - `dispatch(event)` itera suscriptores y envía clones si el evento coincide con el patrón.
+- `EventPattern` puede incluir un `Predicate` sobre el payload: `Always`, `Eq { path, value }` (JSON pointer) o `Contains { path, value }` (array/string).
 - Semántica **at-least-once**: si el receptor se cerró, el `send` falla silenciosamente.
 
 ### En el binding napi
@@ -204,11 +207,47 @@ Cada `put` incrementa `version`. `PutOptions.expected_version`: `None` = sin che
 
 ---
 
-## 9. Grafo de consentimiento (`hivedb-core/src/state/consent_graph.rs`)
+## 9. Harness de larga duración (`hivedb-core/src/causal/`, `context.rs`, `harness.rs`)
+
+El harness convierte el event-log en memoria causal para agentes de larga duración. Tiene tres piezas:
+
+1. **`CausalThread`** (`causal/mod.rs`). Reconstruye, para un `stream_id`, el grafo de decisiones y llamadas a herramientas siguiendo `causation`. Detecta dos anomalías:
+   - `ErrorLoop`: misma herramienta con el mismo error ≥ 3 veces.
+   - `ObjectiveDrift`: decisiones cuya `correlation` difiere del `IntentLogged` inicial.
+2. **`build_agent_context`** (`context.rs`). Construye una ventana de contexto acotada en tokens. Estrategias:
+   - `causal_anchors`: camina hacia atrás desde el objetivo actual incluyendo decisiones causales lejanas.
+   - `compress_completed_phases`: resume fases terminadas en `PhaseSummary` + decisiones clave; mantiene la fase actual completa.
+   - `episodic_similarity`: consulta el índice híbrido filtrando por `kind=episode` y mezcla vector + texto.
+   - `recent_anomalies`: incluye siempre las anomalías detectadas.
+3. **`HarnessLoop::evaluate`** (`harness.rs`). Función pura que recibe un `CausalThread` (y episodios similares) y produce:
+   - `process_quality` (penalizado por anomalías),
+   - `output_quality` (derivado del estado final),
+   - `root_cause` (decisión más temprana con más descendencia de fallos),
+   - `findings` (`InefficientLoop`, `ObjectiveDrift`, `RootCause`, `InsufficientEvidence`),
+   - `proposals` (`LearningProposal`) con `evidence_seqs`, `trigger_seq`, `confidence` y `specificity`.
+
+El evaluador no tiene side effects; el llamador persiste las proposals como eventos `LearningProposal` si quiere auditarlas.
+
+### Contrato de wire (napi/JSON)
+
+`causalThread()`, `buildAgentContext()` y `evaluateHarness()` devuelven JSON serializado directamente desde los structs de Rust (`serde_json::to_string`, sin capa de mapeo intermedia como el resto de `#[napi(object)]`). Todos los structs/enums públicos de `causal/mod.rs`, `context.rs` y `harness.rs` llevan `#[serde(rename_all = "camelCase")]`, así que el JSON expuesto a TS es camelCase (`toolCalls`, `processQuality`, `causedBy`, etc.) aunque los campos internos en Rust sigan snake_case. `ContextItem` usa tagging interno (`#[serde(tag = "type", ...)]`): cada item trae `type: "decision" | "toolCall" | "anomaly" | "episode" | "phaseSummary"` en vez del tagging externo por defecto de serde. La única excepción deliberada es `ToolOutcome` (`"Ok"` / `"Timeout"` / `{"Err": "..."}`), que es el contrato de **entrada** del payload `ToolCall.outcome` (ver `SPEC.md` §2.2 y `docs/AGENT_INTEGRATION.md`) y no se re-castea a camelCase.
+
+### Límite de escalabilidad conocido
+
+`HiveDB::causal_thread()` (`db.rs`) reconstruye el hilo bajo demanda leyendo **todo** el event log de todos los shards (`read_stream_all_agents`) y filtrando por `stream_id` — no lee desde una proyección checkpointeada. Existe un marcador de proyección `CausalThreadProjection` (`state/causal_thread.rs`) con `merge`/`apply` ya implementados, pero **no está registrado** en `default_registry()`, así que nunca participa del checkpointing incremental. En la práctica esto es O(eventos totales de todos los shards) por llamada, no O(eventos del stream), algo que se nota en tareas muy largas con muchos agentes activos (el test `g9d_e2e.rs` ya ejercita un caso de 650 eventos/3 sesiones). Registrar la proyección y leer desde ahí es trabajo de rendimiento pendiente, fuera del alcance del harness de contrato actual.
+
+### Extensión
+
+- Para añadir una nueva anomalía, modifica `causal/mod.rs::detect_anomalies` y el enum `AnomalyKind`.
+- Para cambiar la política de tokens, ajusta `context.rs::estimate_tokens` y el recorte final por presupuesto.
+
+---
+
+## 10. Grafo de consentimiento (`hivedb-core/src/state/consent_graph.rs`)
 
 - Proyección **global**.
 - Estado: `BTreeMap<u64, Grant>` donde la clave es el `seq` del evento `ConsentGranted`.
-- `find_active_grant(agent, action, resource, now)` busca un grant vigente (no revocado, no expirado, scope matching).
+- `find_active_grant(agent, action, resource, now)` busca un grant vigente (no revocado, no expirado, scope matching). La búsqueda es transitiva: una cadena `PM → Lead → Backend` autoriza a `Backend` mientras todos los eslabones sean vigentes. Se detectan ciclos con un `HashSet` de agentes visitados.
 - `ConsentGraph::apply` reacciona a `ConsentGranted` (inserta) y `ConsentRevoked` (elimina por `grant_seq`).
 
 ### Auditoría
@@ -217,7 +256,7 @@ Cada `put` incrementa `version`. `PutOptions.expected_version`: `None` = sin che
 
 ---
 
-## 10. Binding napi-rs (`hivedb-napi`)
+## 11. Binding napi-rs (`hivedb-napi`)
 
 ### Reglas importantes
 
@@ -231,9 +270,17 @@ Cada `put` incrementa `version`. `PutOptions.expected_version`: `None` = sin che
 
 1. Añade método en `#[napi] impl JsHiveDB`.
 2. Convierte tipos JS ↔ Rust en funciones helper (`js_to_*`, `*_to_js`).
+   - `u64` no es nativo de JS; usa `i64` en `#[napi(object)]` y castea.
 3. Recompila con `cargo build -p hivedb-napi --release`.
 4. Actualiza `packages/hive-db/src/index.ts` con tipos y wrapper.
 5. Añade test en `packages/hive-db/test/`.
+
+### Métodos expuestos recientemente
+
+- `workingSet` / `workingGet` / `workingKeys`: memoria de trabajo efímera con TTL.
+- `subscribe` / `events` con `Predicate` (`Eq`, `Contains`, `Always`).
+- `toolStats(tool)`: métricas agregadas de `ToolCall` desde la proyección `ToolLedger`.
+- `lastSeq()`: último `seq` asignado.
 
 ### Construcción del `.node`
 
@@ -246,7 +293,7 @@ El artefacto es un shared object renombrado a `.node` para que Bun/Node lo cargu
 
 ---
 
-## 11. Tests
+## 12. Tests
 
 ### Rust
 
@@ -266,7 +313,7 @@ bun test
 
 ### Convenciones
 
-- Cada gate G1-G8 tiene su archivo de test (`g1_log.rs`, `g2_projections.rs`, …).
+- Cada gate G1-G8 tiene su archivo de test (`g1_log.rs`, `g2_projections.rs`, `g2_tool_ledger.rs`, `g3_working.rs`, …).
 - Los tests de propiedad usan `proptest` donde aplica.
 - Los tests de concurrencia usan `loom` en `g7_concurrency.rs`.
 - Los tests de compilación fallida usan `trybuild`.
@@ -274,7 +321,7 @@ bun test
 
 ---
 
-## 12. Convenciones de código
+## 13. Convenciones de código
 
 - Formato con `rustfmt`.
 - Clippy sin warnings (`-D warnings`).
@@ -284,16 +331,15 @@ bun test
 
 ---
 
-## 13. Roadmap técnico próximo
+## 14. Roadmap técnico próximo
 
-1. Convertir `loom` en `dev-dependency` o feature; hoy es dependencia normal por facilidad de compilación.
-2. Exponer working memory en el binding TS.
-3. Añadir persistencia de checkpoints de proyección más granular.
-4. Mejorar manejo de errores de callback en `ThreadsafeFunction`.
+1. Persistir `seq_to_agent` en `_global.redb` para evitar escanear todos los shards al abrir.
+2. Añadir persistencia de checkpoints de proyección más granular.
+3. Mejorar manejo de errores de callback en `ThreadsafeFunction`.
 
 ---
 
-## 14. Distribución con `@napi-rs/cli`
+## 15. Distribución con `@napi-rs/cli`
 
 El binding nativo se construye, empaqueta y publica usando `@napi-rs/cli` 3.x. Ver `docs/DISTRIBUTION.md` para la guía completa.
 
