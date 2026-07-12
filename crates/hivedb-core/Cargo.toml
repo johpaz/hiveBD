@@ -19,13 +19,15 @@ dashmap = { workspace = true }
 tempfile = "3"
 hivedb-index = { path = "../hivedb-index" }
 tokio = { version = "1", features = ["sync"] }
-loom = "0.7"
 
 [dev-dependencies]
 proptest = "1"
 trybuild = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt", "time"] }
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
 
 [[test]]
 name = "g1_log"
@@ -54,6 +56,22 @@ path = "tests/g6_consent.rs"
 [[test]]
 name = "g7_concurrency"
 path = "tests/g7_concurrency.rs"
+
+[[test]]
+name = "g9a_causal_thread"
+path = "tests/g9a_causal_thread.rs"
+
+[[test]]
+name = "g9b_agent_context"
+path = "tests/g9b_agent_context.rs"
+
+[[test]]
+name = "g9c_harness"
+path = "tests/g9c_harness.rs"
+
+[[test]]
+name = "g9d_e2e"
+path = "tests/g9d_e2e.rs"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

@@ -1,15 +1,54 @@
 use crate::event::{AgentId, Event, EventKindTag, StreamId};
 use dashmap::DashMap;
+use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// A predicate over the payload of an event.
-///
-/// Not evaluated in G5; reserved for future gates.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Predicate {
-    /// Always matches (placeholder).
+    /// Always matches.
     Always,
+    /// Equality of the value at a JSON pointer path.
+    Eq { path: String, value: Value },
+    /// Membership/containment: array contains value, or string contains substring.
+    Contains { path: String, value: Value },
+}
+
+impl Predicate {
+    /// Evaluate the predicate against an event payload.
+    ///
+    /// `path` is interpreted as a JSON pointer (`/field/nested`). If it does not
+    /// start with `/`, a leading slash is inserted automatically.
+    pub fn matches(&self, payload: &Value) -> bool {
+        match self {
+            Predicate::Always => true,
+            Predicate::Eq { path, value } => {
+                let pointer = normalize_pointer(path);
+                payload.pointer(&pointer) == Some(value)
+            }
+            Predicate::Contains { path, value } => {
+                let pointer = normalize_pointer(path);
+                match payload.pointer(&pointer) {
+                    Some(Value::Array(arr)) => arr.contains(value),
+                    Some(Value::String(s)) => match value {
+                        Value::String(sub) => s.contains(sub),
+                        other => s.contains(&other.to_string()),
+                    },
+                    Some(other) => other == value,
+                    None => false,
+                }
+            }
+        }
+    }
+}
+
+fn normalize_pointer(path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    }
 }
 
 /// Pattern used to filter events delivered to a subscription.
@@ -108,6 +147,10 @@ fn matches(pattern: &EventPattern, event: &Event) -> bool {
     {
         return false;
     }
-    // Predicate evaluation is reserved for future gates.
+    if let Some(predicate) = &pattern.predicate
+        && !predicate.matches(&event.payload)
+    {
+        return false;
+    }
     true
 }

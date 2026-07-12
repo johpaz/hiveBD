@@ -93,6 +93,32 @@ await db.append({
 
 El hecho original sigue en el log (auditoría), pero las proyecciones vigentes lo ignoran.
 
+### Métricas de herramientas y último seq
+
+HiveDB acumula estadísticas de cada `ToolCall` automáticamente:
+
+```ts
+const seq = await db.append({
+  agentId: "backend-agent",
+  streamId: "task-42",
+  kind: "ToolCall",
+  payload: JSON.stringify({
+    tool: "web_search",
+    latency_ms: 120,
+    cost: 0.05,
+    outcome: "Ok", // "Ok" | "Timeout" | { Err: "<mensaje>" }
+  }),
+});
+
+const stats = await db.toolStats("web_search");
+console.log(stats?.invocations, stats?.totalLatencyMs, stats?.errors);
+
+const last = await db.lastSeq();
+console.log(last); // seq más alto asignado (puede ser mayor que `seq` si hay otras escrituras)
+```
+
+`outcome: "Timeout"` u `outcome: { Err: "<mensaje>" }` incrementan el contador `errors`. `lastSeq()` nunca escribe en disco; solo lee el contador en memoria.
+
 ---
 
 ## 4. Suscripciones reactivas
@@ -126,7 +152,21 @@ const sub = db.subscribe(
 sub.close();
 ```
 
-El patrón puede filtrar por `agentId`, `kind` y/o `streamId`. Si omites todos, recibes todos los eventos.
+El patrón puede filtrar por `agentId`, `kind`, `streamId` y/o un predicado sobre el `payload`:
+
+```ts
+const alerts = db.events({
+  kind: "Fact",
+  predicate: { kind: "Eq", path: "/severity", value: "critical" },
+});
+
+const mentions = db.events({
+  kind: "Fact",
+  predicate: { kind: "Contains", path: "/tags", value: "billing" },
+});
+```
+
+`Eq` compara por igualdad el valor en una ruta JSON pointer (`/severity` o `severity`). `Contains` comprueba que un array contenga el valor o que un string contenga la subcadena. `Always` coincide siempre. Si omites todos los campos del patrón, recibes todos los eventos.
 
 ---
 
@@ -192,7 +232,7 @@ await db.clearIndex();                                       // vaciar todo el �
 
 ## 6. Consentimiento y autorización
 
-HiveDB incluye un grafo de consentimiento. Un agente puede delegar permisos a otro, revocarlos, y luego consultar si una acción está autorizada.
+HiveDB incluye un grafo de consentimiento. Un agente puede delegar permisos a otro, revocarlos, y luego consultar si una acción está autorizada. Las delegaciones pueden encadenarse transitivamente: si `owner → lead` y `lead → worker`, entonces `worker` está autorizado; la cadena se invalida si cualquier eslabón expira o se revoca.
 
 ### Otorgar consentimiento
 
@@ -304,11 +344,72 @@ Si cualquier operación falla (por ejemplo un `expectedVersion` desactualizado),
 
 Para datos transitorios que no necesitan durabilidad de log pero sí rápido acceso con TTL:
 
-> Actualmente esta API está expuesta solo en el núcleo Rust. En futuras versiones del binding TS se añadirá `workingSet` / `workingGet`.
+```ts
+await db.workingSet("agent-1", "draft", { text: "borrador" });
+const draft = await db.workingGet("agent-1", "draft");
+console.log(draft); // { text: "borrador" }
+
+// Con expiración (TTL en milisegundos)
+await db.workingSet("agent-1", "temp", 42, 1000);
+
+// Listar claves almacenadas por agente
+const keys = await db.workingKeys("agent-1");
+```
+
+La memoria de trabajo no escribe en el event-log: es puramente efímera y se pierde al cerrar la base de datos.
 
 ---
 
-## 9. Cierre y ciclo de vida
+## 9. Harness de larga duración
+
+HiveDB puede reconstruir el hilo causal de una tarea (`streamId`) y generar ventanas de contexto adaptativas para LLMs, además de evaluar el proceso del agente.
+
+### Hilo causal
+
+```ts
+const thread = (await db.causalThread("task-1")) as any;
+console.log(thread.decisions.length, thread.toolCalls.length);
+```
+
+El hilo sigue los enlaces `causation` entre decisiones y llamadas a herramientas, y detecta bucles de error y deriva de objetivo.
+
+### Contexto adaptativo
+
+```ts
+const ctx = (await db.buildAgentContext({
+  taskId: "task-1",
+  currentPhase: "implementation",
+  currentObjective: "fix payment module",
+  maxTokens: 4096,
+  strategy: {
+    causalAnchors: true,
+    compressCompletedPhases: true,
+  },
+})) as any;
+```
+
+El motor garantiza que el contexto resultante nunca exceda `maxTokens`, comprime fases terminadas, mantiene anclas causales y puede incluir episodios similares. Cada item de `ctx.items` trae un campo `type` (`"decision"` / `"toolCall"` / `"anomaly"` / `"episode"` / `"phaseSummary"`) para distinguir la variante.
+
+### Evaluación del proceso
+
+```ts
+const evalResult = (await db.evaluateHarness({
+  causalThread: thread,
+  similarEpisodes: [],
+  originalIntent: "implementar autenticación",
+  currentState: { outcome: "success" },
+  minConfidence: 0.5,
+})) as any;
+
+console.log(evalResult.processQuality, evalResult.outputQuality);
+console.log(evalResult.proposals);
+```
+
+La evaluación es pura: recibe datos y devuelve `processQuality`, `outputQuality`, `rootCause`, `findings` y `proposals` con evidencia causal.
+
+---
+
+## 10. Cierre y ciclo de vida
 
 ```ts
 db.close();
@@ -320,7 +421,7 @@ Si necesitas reconstruir las proyecciones desde cero (por ejemplo tras añadir u
 
 ---
 
-## 10. Patrones recomendados para agentes
+## 11. Patrones recomendados para agentes
 
 1. **Un `agentId` por agente autónomo.** No compartas `agentId` entre instancias concurrentes si no quieres contención de escritura.
 2. **Un `streamId` por objetivo o conversación.** Facilita leer la historia completa de una tarea.
@@ -330,14 +431,15 @@ Si necesitas reconstruir las proyecciones desde cero (por ejemplo tras añadir u
 
 ---
 
-## 11. Referencia rápida de tipos
+## 12. Referencia rápida de tipos
 
 ```ts
 interface EventInput {
   agentId: string;
   streamId: string;
-  kind: "Fact" | "StateTransition" | "MemoryInvalidate" | "ToolCall" | "ConsentGranted" | "ConsentRevoked" | "IntentLogged";
+  kind: "Fact" | "StateTransition" | "MemoryInvalidate" | "ToolCall" | "ConsentGranted" | "ConsentRevoked" | "IntentLogged" | "LearningProposal";
   payload: string; // JSON string
+  causation?: number; // seq del evento que causó este evento
 }
 
 interface Event {
@@ -435,6 +537,32 @@ class HiveDB {
   subscribe(pattern: EventPattern, onEvent: (event: Event) => void): Subscription;
   collection<T = unknown>(name: string): Collection<T>;
   batch(ops: BatchOp[]): Promise<void>;
+  causalThread(streamId: string): Promise<unknown>;
+  buildAgentContext(req: AgentContextRequest): Promise<unknown>;
+  evaluateHarness(input: HarnessInput): Promise<unknown>;
   close(): void;
+}
+
+interface AgentContextRequest {
+  task_id: string;
+  current_phase: string;
+  current_objective: string;
+  max_tokens: number;
+  strategy: ContextStrategy;
+}
+
+interface ContextStrategy {
+  causal_anchors?: boolean;
+  compress_completed_phases?: boolean;
+  episodic_similarity?: { vector: Float32Array; k: number };
+  recent_anomalies?: { window_ms: number };
+}
+
+interface HarnessInput {
+  causal_thread: unknown;
+  similar_episodes?: unknown[];
+  original_intent?: string;
+  current_state?: unknown;
+  min_confidence?: number;
 }
 ```

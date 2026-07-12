@@ -18,6 +18,7 @@ const EVENTS_TABLE: TableDefinition<u64, Vec<u8>> = TableDefinition::new("events
 const PROJECTION_CHECKPOINTS: TableDefinition<&str, u64> =
     TableDefinition::new("projection_checkpoints");
 const PROJECTION_STATE: TableDefinition<&str, Vec<u8>> = TableDefinition::new("projection_state");
+const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("meta");
 
 /// Internal sharded event-log implementation on top of `redb`.
 pub(crate) struct EventLog {
@@ -104,7 +105,33 @@ impl EventLog {
             }
             self.shards.insert(agent_id, Arc::clone(&shard));
         }
-        self.next_seq.store(max_seq + 1, Ordering::SeqCst);
+
+        let scanned_next = max_seq + 1;
+        let stored_next = self.read_stored_next_seq()?.unwrap_or(1);
+        let next = scanned_next.max(stored_next);
+        self.next_seq.store(next, Ordering::SeqCst);
+        self.write_stored_next_seq(next)?;
+        Ok(())
+    }
+
+    fn read_stored_next_seq(&self) -> HiveResult<Option<u64>> {
+        let txn = self.global.db.begin_read()?;
+        let table = txn.open_table(META_TABLE)?;
+        Ok(table.get("next_seq")?.map(|v| v.value()))
+    }
+
+    pub(crate) fn flush_next_seq(&self) -> HiveResult<()> {
+        let next = self.next_seq.load(Ordering::SeqCst);
+        self.write_stored_next_seq(next)
+    }
+
+    fn write_stored_next_seq(&self, value: u64) -> HiveResult<()> {
+        let txn = self.global.db.begin_write()?;
+        {
+            let mut table = txn.open_table(META_TABLE)?;
+            table.insert("next_seq", value)?;
+        }
+        txn.commit()?;
         Ok(())
     }
 
@@ -140,6 +167,11 @@ impl EventLog {
         if is_global {
             self.global
                 .append_event(&event, &mut self.registry.global_handlers())?;
+            // Persist the next free sequence number together with the global
+            // write so reopening does not have to rediscover it by scanning
+            // every shard. Non-global events skip this write to preserve the
+            // per-agent write isolation that sharding provides.
+            self.write_stored_next_seq(seq + 1)?;
         }
 
         self.seq_to_agent.insert(seq, input.agent_id);
@@ -192,6 +224,24 @@ impl EventLog {
             }
             None => Ok(Vec::new()),
         }
+    }
+
+    /// Read all events for a stream across every agent shard, sorted by seq.
+    pub(crate) fn read_stream_all_agents(
+        &self,
+        stream_id: &crate::event::StreamId,
+    ) -> HiveResult<Vec<Event>> {
+        let mut out = Vec::new();
+        for entry in self.shards.iter() {
+            let shard = entry.value();
+            for event in shard.iter_events()? {
+                if &event.stream_id == stream_id {
+                    out.push(event);
+                }
+            }
+        }
+        out.sort_by_key(|e| e.seq);
+        Ok(out)
     }
 
     /// Query the current state of a projection.

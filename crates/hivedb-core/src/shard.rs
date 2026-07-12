@@ -11,6 +11,7 @@ const EVENTS_TABLE: TableDefinition<u64, Vec<u8>> = TableDefinition::new("events
 const PROJECTION_CHECKPOINTS: TableDefinition<&str, u64> =
     TableDefinition::new("projection_checkpoints");
 const PROJECTION_STATE: TableDefinition<&str, Vec<u8>> = TableDefinition::new("projection_state");
+const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("meta");
 
 /// A single-agent shard: one `redb` database plus a mutex that serializes
 /// writes for that agent.
@@ -29,6 +30,7 @@ impl AgentShard {
             txn.open_table(EVENTS_TABLE)?;
             txn.open_table(PROJECTION_CHECKPOINTS)?;
             txn.open_table(PROJECTION_STATE)?;
+            txn.open_table(META_TABLE)?;
             txn.commit()?;
         }
         Ok(Self {

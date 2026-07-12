@@ -11,6 +11,8 @@ interface JsHiveDbInner {
   append(input: JsEventInput): Promise<number>;
   read(seq: number): Promise<JsEvent>;
   logLen(): Promise<number>;
+  lastSeq(): Promise<number>;
+  toolStats(tool: string): Promise<JsToolStats | null>;
   projectTaskState(agentId: string, streamId: string): Promise<string | null>;
   can(agent: string, action: string, resource: string): Promise<JsDecision>;
   indexDoc(
@@ -33,6 +35,12 @@ interface JsHiveDbInner {
   colFindBy(collection: string, field: string, valueJson: string, options?: JsScanOptions): Promise<JsDocEntry[]>;
   colBatch(ops: JsColOp[]): Promise<void>;
   queryHybrid(query: JsHybridQuery): Promise<JsHit[]>;
+  causalThread(streamId: string): Promise<string>;
+  buildAgentContext(reqJson: string): Promise<string>;
+  evaluateHarness(inputJson: string): Promise<string>;
+  workingSet(agentId: string, key: string, json: string, ttlMs?: number): Promise<void>;
+  workingGet(agentId: string, key: string): Promise<string | undefined>;
+  workingKeys(agentId: string): Promise<string[]>;
   subscribe(
     pattern: JsEventPattern,
     callback: (err: Error | null, event: JsEvent) => void
@@ -88,6 +96,7 @@ interface JsEventInput {
   streamId: string;
   kind: string;
   payload: string;
+  causation?: number;
 }
 
 interface JsEvent {
@@ -109,6 +118,15 @@ interface JsDecision {
 interface JsScalarFilter {
   field: string;
   value: string;
+}
+
+interface JsToolStats {
+  invocations: number;
+  errors: number;
+  totalLatencyMs: number;
+  totalCost: number;
+  lastOutcome?: string;
+  lastSeq: number;
 }
 
 interface JsHybridQuery {
@@ -142,13 +160,21 @@ interface JsEventPattern {
   agentId?: string;
   kind?: string;
   streamId?: string;
+  predicate?: JsPredicate;
+}
+
+interface JsPredicate {
+  kind: "Eq" | "Contains" | "Always";
+  path?: string;
+  value?: string;
 }
 
 export interface EventInput {
   agentId: string;
   streamId: string;
-  kind: "Fact" | "StateTransition" | "MemoryInvalidate" | "ToolCall" | "ConsentGranted" | "ConsentRevoked" | "IntentLogged";
+  kind: "Fact" | "StateTransition" | "MemoryInvalidate" | "ToolCall" | "ConsentGranted" | "ConsentRevoked" | "IntentLogged" | "LearningProposal";
   payload: string;
+  causation?: number;
 }
 
 export interface Event {
@@ -165,6 +191,38 @@ export interface Event {
 export interface Decision {
   allowed: boolean;
   intentLogSeq?: number;
+}
+
+export interface AgentContextRequest {
+  taskId: string;
+  currentPhase: string;
+  currentObjective: string;
+  maxTokens: number;
+  strategy: ContextStrategy;
+}
+
+export interface ContextStrategy {
+  causalAnchors?: boolean;
+  compressCompletedPhases?: boolean;
+  episodicSimilarity?: EpisodicConfig;
+  recentAnomalies?: AnomalyConfig;
+}
+
+export interface EpisodicConfig {
+  vector: Float32Array;
+  k: number;
+}
+
+export interface AnomalyConfig {
+  windowMs: number;
+}
+
+export interface HarnessInput {
+  causalThread: unknown;
+  similarEpisodes?: unknown[];
+  originalIntent?: string;
+  currentState?: unknown;
+  minConfidence?: number;
 }
 
 export interface ScalarFilter {
@@ -232,6 +290,16 @@ export interface Hit {
   score: number;
   textScore?: number;
   vectorScore?: number;
+}
+
+/** Aggregated statistics for a tool recorded in the event log. */
+export interface ToolStats {
+  invocations: number;
+  errors: number;
+  totalLatencyMs: number;
+  totalCost: number;
+  lastOutcome?: string;
+  lastSeq: number;
 }
 
 /** A document read from a collection. */
@@ -329,10 +397,34 @@ export class Collection<T = unknown> {
   }
 }
 
+export type Predicate =
+  | { kind: "Eq"; path: string; value: unknown }
+  | { kind: "Contains"; path: string; value: unknown }
+  | { kind: "Always" };
+
 export interface EventPattern {
   agentId?: string;
   kind?: EventInput["kind"];
   streamId?: string;
+  predicate?: Predicate;
+}
+
+function toJsPattern(pattern: EventPattern): JsEventPattern {
+  return {
+    agentId: pattern.agentId,
+    kind: pattern.kind,
+    streamId: pattern.streamId,
+    predicate: pattern.predicate
+      ? {
+          kind: pattern.predicate.kind,
+          path: pattern.predicate.kind === "Always" ? undefined : pattern.predicate.path,
+          value:
+            pattern.predicate.kind === "Always"
+              ? undefined
+              : JSON.stringify(pattern.predicate.value),
+        }
+      : undefined,
+  };
 }
 
 export interface Subscription {
@@ -366,12 +458,53 @@ export class HiveDB {
     return this.inner.logLen();
   }
 
+  async lastSeq(): Promise<number> {
+    return this.inner.lastSeq();
+  }
+
+  async toolStats(tool: string): Promise<ToolStats | undefined> {
+    const stats = await this.inner.toolStats(tool);
+    return stats ?? undefined;
+  }
+
   async projectTaskState(agentId: string, streamId: string): Promise<string | undefined> {
     return (await this.inner.projectTaskState(agentId, streamId)) ?? undefined;
   }
 
   async can(agent: string, action: string, resource: string): Promise<Decision> {
     return this.inner.can(agent, action, resource);
+  }
+
+  /** Build the causal thread for a task. */
+  async causalThread(streamId: string): Promise<unknown> {
+    return JSON.parse(await this.inner.causalThread(streamId));
+  }
+
+  /** Build an adaptive, token-bounded context window for an agent. */
+  async buildAgentContext(req: AgentContextRequest): Promise<unknown> {
+    return JSON.parse(await this.inner.buildAgentContext(JSON.stringify(req)));
+  }
+
+  /** Evaluate a task with the harness loop. */
+  async evaluateHarness(input: HarnessInput): Promise<unknown> {
+    return JSON.parse(await this.inner.evaluateHarness(JSON.stringify(input)));
+  }
+
+  /** Store a value in working memory with an optional TTL in milliseconds. */
+  async workingSet(agentId: string, key: string, value: unknown, ttlMs?: number): Promise<void> {
+    return this.inner.workingSet(agentId, key, JSON.stringify(value), ttlMs);
+  }
+
+  /** Retrieve a value from working memory, returning `undefined` if expired or missing. */
+  async workingGet<T = unknown>(agentId: string, key: string): Promise<T | undefined> {
+    const json = await this.inner.workingGet(agentId, key);
+    if (json == null) return undefined;
+    return JSON.parse(json) as T;
+  }
+
+  /** Return all non-expired keys for an agent. */
+  async workingKeys(agentId: string): Promise<string[]> {
+    return this.inner.workingKeys(agentId);
   }
 
   /** @deprecated Use {@link upsertDoc}; `text` maps to the `body` field. */
@@ -442,7 +575,7 @@ export class HiveDB {
   }
 
   subscribe(pattern: EventPattern, onEvent: (event: Event) => void): Subscription {
-    return this.inner.subscribe(pattern, (_err: Error | null, event: JsEvent | null | undefined) => {
+    return this.inner.subscribe(toJsPattern(pattern), (_err: Error | null, event: JsEvent | null | undefined) => {
       if (event != null) onEvent(event);
     });
   }
@@ -452,7 +585,7 @@ export class HiveDB {
     let resolveNext: ((result: IteratorResult<Event>) => void) | null = null;
     let closed = false;
 
-    const subscription = this.inner.subscribe(pattern, (_err: Error | null, event: JsEvent | null | undefined) => {
+    const subscription = this.inner.subscribe(toJsPattern(pattern), (_err: Error | null, event: JsEvent | null | undefined) => {
       if (closed || event == null) return;
       if (resolveNext) {
         resolveNext({ value: event, done: false });

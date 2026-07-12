@@ -1,8 +1,9 @@
 mod common;
 
 use common::{db, fact, invalidate};
-use hivedb_core::CurrentFactsState;
+use hivedb_core::{CurrentFactsState, HiveDB};
 use serde_json::json;
+use tempfile::tempdir;
 
 #[test]
 fn seq_is_monotonic_and_engine_assigned() {
@@ -47,4 +48,48 @@ fn correction_is_a_new_invalidating_event() {
 
     // The invalidating event has a higher sequence number.
     assert!(inval_seq > fact_seq);
+}
+
+#[test]
+fn next_seq_survives_reopen_without_rescan() {
+    let dir = tempdir().unwrap();
+
+    let db = HiveDB::open(dir.path()).unwrap();
+    let s1 = db.append(fact("A", "s1")).unwrap();
+    drop(db);
+
+    let db2 = HiveDB::open(dir.path()).unwrap();
+    let s2 = db2.append(fact("A", "s1")).unwrap();
+
+    assert_eq!(s2, s1 + 1);
+    assert_eq!(db2.last_seq().unwrap(), s2);
+}
+
+#[test]
+fn reopen_without_meta_falls_back_to_scan() {
+    let dir = tempdir().unwrap();
+
+    {
+        let db = HiveDB::open(dir.path()).unwrap();
+        db.append(fact("A", "s1")).unwrap();
+    }
+
+    // Simulate an older database that has no `next_seq` meta entry.
+    let global_path = dir.path().join("shards/_global.redb");
+    let redb = redb::Database::create(&global_path).unwrap();
+    {
+        let txn = redb.begin_write().unwrap();
+        {
+            let mut table = txn
+                .open_table(redb::TableDefinition::<&str, u64>::new("meta"))
+                .unwrap();
+            table.remove("next_seq").unwrap();
+        }
+        txn.commit().unwrap();
+    }
+    drop(redb);
+
+    let db = HiveDB::open(dir.path()).unwrap();
+    let seq = db.append(fact("A", "s1")).unwrap();
+    assert_eq!(seq, 2);
 }

@@ -105,6 +105,16 @@ impl MemoryEventLog {
         Ok(out)
     }
 
+    pub(crate) fn read_stream_all_agents(&self, stream_id: &StreamId) -> HiveResult<Vec<Event>> {
+        let shards = self.shards.lock().unwrap();
+        let mut out: Vec<Event> = shards
+            .values()
+            .flat_map(|events| events.iter().filter(|e| &e.stream_id == stream_id).cloned())
+            .collect();
+        out.sort_by_key(|e| e.seq);
+        Ok(out)
+    }
+
     pub(crate) fn project<P: Projection>(&self) -> HiveResult<P::State> {
         // In-memory backend does not materialize projections.
         Ok(P::State::default())

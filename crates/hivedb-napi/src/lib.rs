@@ -1,6 +1,6 @@
 use hivedb_core::{
-    AgentId, ColOp, Decision, DocEntry, EventInput, EventKind, EventPattern, HiveDB, OpenOptions,
-    PutOptions, ScanOptions, StreamId,
+    AgentContextRequest, AgentId, ColOp, Decision, DocEntry, EventInput, EventKind, EventPattern,
+    HarnessInput, HarnessLoop, HiveDB, OpenOptions, PutOptions, ScanOptions, StreamId, ToolStats,
 };
 use hivedb_index::{FieldBoosts, Fusion, Hit as CoreHit, HybridQuery, IndexDoc, ScalarFilter};
 use napi::bindgen_prelude::*;
@@ -16,6 +16,7 @@ pub struct JsEventInput {
     pub stream_id: String,
     pub kind: String,
     pub payload: String,
+    pub causation: Option<i64>,
 }
 
 #[napi(object)]
@@ -55,6 +56,16 @@ pub struct JsFieldBoosts {
     pub name: Option<f64>,
     pub body: Option<f64>,
     pub tags: Option<f64>,
+}
+
+#[napi(object)]
+pub struct JsToolStats {
+    pub invocations: i64,
+    pub errors: i64,
+    pub total_latency_ms: i64,
+    pub total_cost: f64,
+    pub last_outcome: Option<String>,
+    pub last_seq: i64,
 }
 
 #[napi(object)]
@@ -133,6 +144,17 @@ pub struct JsEventPattern {
     pub agent_id: Option<String>,
     pub kind: Option<String>,
     pub stream_id: Option<String>,
+    pub predicate: Option<JsPredicate>,
+}
+
+#[napi(object)]
+pub struct JsPredicate {
+    /// `"Eq"` | `"Contains"` | `"Always"`.
+    pub kind: String,
+    /// JSON pointer path inside the payload (e.g. `"/temperature"` or `"temperature"`).
+    pub path: Option<String>,
+    /// JSON-encoded value used by `Eq` and `Contains`.
+    pub value: Option<String>,
 }
 
 fn js_err<E: std::fmt::Display>(e: E) -> Error {
@@ -219,10 +241,16 @@ fn js_to_event_input(input: JsEventInput) -> Result<EventInput> {
                 authorized_by,
             }
         }
+        "LearningProposal" => EventKind::LearningProposal,
         other => return Err(Error::from_reason(format!("unknown event kind: {other}"))),
     };
 
-    Ok(EventInput::new(input.agent_id, input.stream_id, kind).with_payload(payload))
+    let mut event_input =
+        EventInput::new(input.agent_id, input.stream_id, kind).with_payload(payload);
+    if let Some(seq) = input.causation {
+        event_input = event_input.with_causation(seq as u64);
+    }
+    Ok(event_input)
 }
 
 fn event_to_js(event: &hivedb_core::Event) -> JsEvent {
@@ -316,8 +344,19 @@ fn decision_to_js(decision: Decision) -> JsDecision {
     }
 }
 
+fn tool_stats_to_js(stats: ToolStats) -> JsToolStats {
+    JsToolStats {
+        invocations: stats.invocations as i64,
+        errors: stats.errors as i64,
+        total_latency_ms: stats.total_latency_ms as i64,
+        total_cost: stats.total_cost,
+        last_outcome: stats.last_outcome,
+        last_seq: stats.last_seq as i64,
+    }
+}
+
 fn js_to_event_pattern(pattern: JsEventPattern) -> Result<EventPattern> {
-    use hivedb_core::EventKindTag;
+    use hivedb_core::{EventKindTag, Predicate};
 
     let kind = match pattern.kind.as_deref() {
         Some("Fact") => Some(EventKindTag::Fact),
@@ -331,11 +370,43 @@ fn js_to_event_pattern(pattern: JsEventPattern) -> Result<EventPattern> {
         None => None,
     };
 
+    let predicate = match pattern.predicate {
+        Some(p) => match p.kind.as_str() {
+            "Eq" => {
+                let path = p
+                    .path
+                    .ok_or_else(|| Error::from_reason("Eq predicate requires path"))?;
+                let value_json = p
+                    .value
+                    .ok_or_else(|| Error::from_reason("Eq predicate requires value"))?;
+                let value = parse_payload(&value_json)?;
+                Some(Predicate::Eq { path, value })
+            }
+            "Contains" => {
+                let path = p
+                    .path
+                    .ok_or_else(|| Error::from_reason("Contains predicate requires path"))?;
+                let value_json = p
+                    .value
+                    .ok_or_else(|| Error::from_reason("Contains predicate requires value"))?;
+                let value = parse_payload(&value_json)?;
+                Some(Predicate::Contains { path, value })
+            }
+            "Always" => Some(Predicate::Always),
+            other => {
+                return Err(Error::from_reason(format!(
+                    "unknown predicate kind: {other} (expected Eq, Contains or Always)"
+                )));
+            }
+        },
+        None => None,
+    };
+
     Ok(EventPattern {
         agent_id: pattern.agent_id.map(AgentId::from),
         kind,
         stream_id: pattern.stream_id.map(StreamId::from),
-        predicate: None,
+        predicate,
     })
 }
 
@@ -445,6 +516,19 @@ impl JsHiveDB {
         self.with_db(|db| db.log_len().map_err(js_err).map(|len| len as i64))
     }
 
+    #[napi(js_name = "lastSeq")]
+    pub async fn last_seq(&self) -> Result<i64> {
+        self.with_db(|db| db.last_seq().map_err(js_err).map(|seq| seq as i64))
+    }
+
+    #[napi(js_name = "toolStats")]
+    pub async fn tool_stats(&self, tool: String) -> Result<Option<JsToolStats>> {
+        self.with_db(|db| {
+            let stats = db.tool_stats(&tool).map_err(js_err)?;
+            Ok(stats.map(tool_stats_to_js))
+        })
+    }
+
     #[napi]
     pub async fn project_task_state(
         &self,
@@ -466,6 +550,71 @@ impl JsHiveDB {
             let decision = db.can(agent, action, resource).map_err(js_err)?;
             Ok(decision_to_js(decision))
         })
+    }
+
+    /// Store a value in working memory with an optional TTL (milliseconds).
+    #[napi(js_name = "workingSet")]
+    pub async fn working_set(
+        &self,
+        agent_id: String,
+        key: String,
+        json: String,
+        ttl_ms: Option<i64>,
+    ) -> Result<()> {
+        let value = parse_payload(&json)?;
+        let ttl = ttl_ms.map(|ms| std::time::Duration::from_millis(ms.max(0) as u64));
+        self.with_db(|db| {
+            db.working_set(agent_id, key, value, ttl);
+            Ok(())
+        })
+    }
+
+    /// Retrieve a value from working memory, returning `None` if expired or missing.
+    #[napi(js_name = "workingGet")]
+    pub async fn working_get(&self, agent_id: String, key: String) -> Result<Option<String>> {
+        self.with_db(|db| {
+            Ok(db
+                .working_get(agent_id.clone(), &key)
+                .map(|value| value.to_string()))
+        })
+    }
+
+    /// Return all non-expired keys for an agent.
+    #[napi(js_name = "workingKeys")]
+    pub async fn working_keys(&self, agent_id: String) -> Result<Vec<String>> {
+        self.with_db(|db| Ok(db.working_keys(agent_id.clone())))
+    }
+
+    /// Build the causal thread for a task as a JSON string.
+    #[napi(js_name = "causalThread")]
+    pub async fn causal_thread(&self, stream_id: String) -> Result<String> {
+        self.with_db(|db| {
+            let thread = db.causal_thread(stream_id).map_err(js_err)?;
+            serde_json::to_string(&thread)
+                .map_err(|e| Error::from_reason(format!("serialization error: {e}")))
+        })
+    }
+
+    /// Build an agent context window for a task as a JSON string.
+    #[napi(js_name = "buildAgentContext")]
+    pub async fn build_agent_context(&self, req_json: String) -> Result<String> {
+        self.with_db(|db| {
+            let req: AgentContextRequest = serde_json::from_str(&req_json)
+                .map_err(|e| Error::from_reason(format!("invalid request: {e}")))?;
+            let ctx = db.build_agent_context(req).map_err(js_err)?;
+            serde_json::to_string(&ctx)
+                .map_err(|e| Error::from_reason(format!("serialization error: {e}")))
+        })
+    }
+
+    /// Evaluate a task with the harness loop. Input and output are JSON strings.
+    #[napi(js_name = "evaluateHarness")]
+    pub async fn evaluate_harness(&self, input_json: String) -> Result<String> {
+        let input: HarnessInput = serde_json::from_str(&input_json)
+            .map_err(|e| Error::from_reason(format!("invalid input: {e}")))?;
+        let eval = HarnessLoop::evaluate(input);
+        serde_json::to_string(&eval)
+            .map_err(|e| Error::from_reason(format!("serialization error: {e}")))
     }
 
     /// Deprecated: use `upsertDoc`. Kept for one version; `text` maps to the

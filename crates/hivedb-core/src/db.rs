@@ -9,7 +9,10 @@ use crate::memory_log::MemoryEventLog;
 use crate::projection::{Projection, ProjectionRegistry};
 use crate::reactive::{EventPattern, ReactiveEngine, Subscription};
 use crate::state::{
-    consent_graph::ConsentGraph, current_facts::CurrentFacts, task_state::TaskState,
+    consent_graph::ConsentGraph,
+    current_facts::CurrentFacts,
+    task_state::TaskState,
+    tool_ledger::{ToolLedger, ToolStats},
 };
 use hivedb_index::{Hit, HybridQuery, IndexDoc, ScalarFilter, SemanticIndex};
 use serde_json::Value;
@@ -122,11 +125,27 @@ impl LogHandle {
         }
     }
 
+    fn last_seq(&self) -> HiveResult<u64> {
+        match self {
+            LogHandle::Redb(log) => log.last_seq(),
+            #[cfg(any(test, loom))]
+            LogHandle::Memory(log) => log.len(),
+        }
+    }
+
     fn read_stream(&self, agent_id: &AgentId, stream_id: &StreamId) -> HiveResult<Vec<Event>> {
         match self {
             LogHandle::Redb(log) => log.read_stream(agent_id, stream_id),
             #[cfg(any(test, loom))]
             LogHandle::Memory(log) => log.read_stream(agent_id, stream_id),
+        }
+    }
+
+    fn read_stream_all_agents(&self, stream_id: &StreamId) -> HiveResult<Vec<Event>> {
+        match self {
+            LogHandle::Redb(log) => log.read_stream_all_agents(stream_id),
+            #[cfg(any(test, loom))]
+            LogHandle::Memory(log) => log.read_stream_all_agents(stream_id),
         }
     }
 
@@ -151,6 +170,14 @@ impl LogHandle {
             LogHandle::Redb(log) => log.wipe_projections_and_rebuild(),
             #[cfg(any(test, loom))]
             LogHandle::Memory(log) => log.wipe_projections_and_rebuild(),
+        }
+    }
+
+    fn flush_next_seq(&self) -> HiveResult<()> {
+        match self {
+            LogHandle::Redb(log) => log.flush_next_seq(),
+            #[cfg(any(test, loom))]
+            LogHandle::Memory(_) => Ok(()),
         }
     }
 }
@@ -299,6 +326,13 @@ impl HiveDB {
     /// Returns the last sequence number applied to a projection.
     pub fn projection_checkpoint<P: Projection>(&self) -> HiveResult<u64> {
         self.log.projection_checkpoint::<P>()
+    }
+
+    /// Returns aggregated statistics for a tool, if any `ToolCall` events have
+    /// been recorded for it.
+    pub fn tool_stats(&self, tool: &str) -> HiveResult<Option<ToolStats>> {
+        let state = self.log.project::<ToolLedger>()?;
+        Ok(state.get(tool).cloned())
     }
 
     /// Store a value in working memory with an optional TTL.
@@ -472,6 +506,11 @@ impl HiveDB {
         self.log.len()
     }
 
+    /// Returns the highest assigned sequence number, or 0 if the log is empty.
+    pub fn last_seq(&self) -> HiveResult<u64> {
+        self.log.last_seq()
+    }
+
     /// Read all events for a given agent/stream in ascending order.
     pub fn read_stream(&self, agent_id: &AgentId, stream_id: &StreamId) -> HiveResult<Vec<Event>> {
         self.log.read_stream(agent_id, stream_id)
@@ -517,6 +556,24 @@ impl HiveDB {
             intent_log_seq: Some(intent_seq),
         })
     }
+
+    /// Build the causal thread for a given stream.
+    pub fn causal_thread(
+        &self,
+        stream_id: impl Into<StreamId>,
+    ) -> HiveResult<crate::causal::CausalThread> {
+        let stream_id = stream_id.into();
+        let events = self.log.read_stream_all_agents(&stream_id)?;
+        Ok(crate::causal::CausalThread::from_events(&events))
+    }
+}
+
+impl Drop for HiveDB {
+    fn drop(&mut self) {
+        // Best-effort flush of the next sequence number so graceful shutdowns
+        // avoid a full shard scan on the next open.
+        let _ = self.log.flush_next_seq();
+    }
 }
 
 /// Result of an authorization check.
@@ -543,6 +600,7 @@ fn default_registry() -> ProjectionRegistry {
     registry.register::<CurrentFacts>();
     registry.register::<TaskState>();
     registry.register::<ConsentGraph>();
+    registry.register::<ToolLedger>();
     registry
 }
 
