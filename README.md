@@ -48,6 +48,35 @@ HiveDB modela el estado como un **event-log append-only inmutable** sobre el que
 └──────────────────────────────────────────────────────────┘
 ```
 
+## Comparación con otros motores
+
+HiveDB no compite de frente con un motor SQL de propósito general — resuelve un problema
+distinto (memoria/persistencia agent-native) — pero al ser embebido y estar escrito en Rust,
+es natural compararlo contra los dos referentes más claros de ese espacio:
+[FrankenSQLite](https://frankensqlite.com/) y [DuckDB](https://duckdb.org/).
+
+| | **HiveDB** | **FrankenSQLite** | **DuckDB** |
+|---|---|---|---|
+| Lenguaje | Rust (`unsafe` minimizado, solo en fronteras mmap/FFI) | Rust (cero `unsafe`, `#[forbid(unsafe_code)]` en las 26 crates) | C++ |
+| Modelo de datos | Event-log append-only + proyecciones deterministas derivadas | Relacional, compatible con archivos `.db`/WAL de SQLite | Relacional columnar (OLAP) |
+| Interfaz de consulta | API tipada (`append/query/subscribe/project`), sin SQL | SQL (dialecto SQLite) | SQL (dialecto propio, orientado a analítica) |
+| Concurrencia de escritura | Particionada por `agent_id`, verificada con `loom` | MVCC a nivel de página, multi-writer concurrente | Proceso único, pensado para lecturas batch/analíticas |
+| Caso de uso principal | Memoria/estado de agentes de IA: hechos, tareas, causalidad | Reemplazo drop-in de SQLite para OLTP embebido | Analítica embebida sobre datasets (Parquet/CSV/etc.) |
+| Búsqueda semántica | Híbrida nativa: BM25 (`tantivy`) + ANN (`hnsw_rs`) + RRF | No | No (requiere extensiones) |
+| Motor reactivo (push) | Sí — suscripciones nativas del motor (G5) | No | No |
+| Primitivas agent-native | Sí — Consent Graph, `IntentLogged`, harness causal (G9) | No | No |
+| Embebido / sin daemon | Sí | Sí | Sí |
+
+**En una frase:** FrankenSQLite reimplementa SQLite en Rust para OLTP transaccional
+multi-writer; DuckDB es un motor analítico columnar para consultas OLAP sobre datasets; HiveDB
+no es ninguno de los dos — es un motor de event-sourcing especializado en modelar el estado, la
+memoria semántica y la causalidad de un agente de IA, con el motor reactivo y el grafo de
+consentimiento como primitivas de primera clase del núcleo, no como capas añadidas sobre un
+motor SQL genérico.
+
+> No hay benchmarks propios todavía contra ninguno de los dos — esta tabla es una comparación
+> de diseño/alcance, no de rendimiento.
+
 ## Crates
 
 - **`hivedb-core`** — motor de event-log, proyecciones, memoria de trabajo, motor reactivo y grafo de consentimiento.
