@@ -88,3 +88,38 @@ test("G9 harness > evaluateHarness detects an error loop", async () => {
 
   db.close();
 });
+
+// Regression guard for the correlation gap found in review: JsEventInput used
+// to have no `correlation` field at all, so objectiveDrift could never fire
+// for anything appended via napi/JS, regardless of how the caller used the
+// API. This exercises the full round trip through the native binding.
+test("G9 harness > correlation round-trips through napi and drives objectiveDrift", async () => {
+  const db = await HiveDB.open(tmpDir());
+  const intentCorrelation = crypto.randomUUID();
+  const driftCorrelation = crypto.randomUUID();
+
+  await db.append({
+    agentId: "PM",
+    streamId: "task-1",
+    kind: "IntentLogged",
+    payload: JSON.stringify({ actor: "PM", intent: "implementar autenticación" }),
+    correlation: intentCorrelation,
+  });
+
+  for (let i = 0; i < 6; i++) {
+    await db.append({
+      agentId: "Backend",
+      streamId: "task-1",
+      kind: "StateTransition",
+      payload: JSON.stringify({ description: `refactorizar ORM ${i}` }),
+      correlation: driftCorrelation,
+    });
+  }
+
+  const thread = (await db.causalThread("task-1")) as any;
+  expect(thread.decisions.every((d: any) => d.correlation === driftCorrelation)).toBe(true);
+  const drift = thread.anomalies.find((a: any) => a.kind === "objectiveDrift");
+  expect(drift).toBeDefined();
+
+  db.close();
+});

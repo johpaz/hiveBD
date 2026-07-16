@@ -175,6 +175,8 @@ export interface EventInput {
   kind: "Fact" | "StateTransition" | "MemoryInvalidate" | "ToolCall" | "ConsentGranted" | "ConsentRevoked" | "IntentLogged" | "LearningProposal";
   payload: string;
   causation?: number;
+  /** UUID string. Links this event to others sharing the same objective/intent. */
+  correlation?: string;
 }
 
 export interface Event {

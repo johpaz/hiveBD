@@ -17,6 +17,10 @@ pub struct JsEventInput {
     pub kind: String,
     pub payload: String,
     pub causation: Option<i64>,
+    /// UUID string. Links this event to others sharing the same objective/
+    /// intent, so `causalThread()`'s objectiveDrift detector can tell a
+    /// decision apart from the stream's original `IntentLogged` correlation.
+    pub correlation: Option<String>,
 }
 
 #[napi(object)]
@@ -249,6 +253,11 @@ fn js_to_event_input(input: JsEventInput) -> Result<EventInput> {
         EventInput::new(input.agent_id, input.stream_id, kind).with_payload(payload);
     if let Some(seq) = input.causation {
         event_input = event_input.with_causation(seq as u64);
+    }
+    if let Some(corr) = input.correlation {
+        let parsed = uuid::Uuid::parse_str(&corr)
+            .map_err(|e| Error::from_reason(format!("invalid correlation UUID: {e}")))?;
+        event_input.correlation = Some(parsed);
     }
     Ok(event_input)
 }
