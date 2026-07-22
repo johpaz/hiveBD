@@ -228,12 +228,27 @@ impl TextIndex {
 
     /// Return the ids of every document carrying the given scalar filter.
     pub fn ids_by_filter(&self, filter: &ScalarFilter) -> crate::Result<Vec<String>> {
+        self.ids_by_filters(std::slice::from_ref(filter))
+    }
+
+    /// Return ids carrying every supplied scalar filter.
+    pub fn ids_by_filters(&self, filters: &[ScalarFilter]) -> crate::Result<Vec<String>> {
         self.reader.reload()?;
         let searcher = self.reader.searcher();
-        let query = TermQuery::new(
-            Term::from_field_text(self.filters_field, &filter_token(filter)),
-            IndexRecordOption::Basic,
-        );
+        let clauses = filters
+            .iter()
+            .map(|filter| {
+                let query = TermQuery::new(
+                    Term::from_field_text(self.filters_field, &filter_token(filter)),
+                    IndexRecordOption::Basic,
+                );
+                (
+                    Occur::Must,
+                    Box::new(query) as Box<dyn tantivy::query::Query>,
+                )
+            })
+            .collect();
+        let query = BooleanQuery::new(clauses);
         let addresses = searcher.search(&query, &tantivy::collector::DocSetCollector)?;
 
         let mut ids = Vec::with_capacity(addresses.len());

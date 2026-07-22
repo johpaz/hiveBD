@@ -20,56 +20,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-const DEFAULT_VECTOR_DIMENSION: usize = 384;
-
-/// File under the base directory recording immutable per-database settings.
-const META_FILE: &str = "meta.json";
+pub use hivedb_index::VectorConfig as VectorOptions;
 
 /// Options for opening a database.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct OpenOptions {
-    /// Dimension of vectors accepted by the semantic index. Fixed at first
-    /// open; reopening with a different value is an error.
-    pub vector_dimension: usize,
-}
-
-impl Default for OpenOptions {
-    fn default() -> Self {
-        Self {
-            vector_dimension: DEFAULT_VECTOR_DIMENSION,
-        }
-    }
-}
-
-/// Load the persisted vector dimension, or persist `requested` on first open.
-/// Returns an error if the database was created with a different dimension.
-fn resolve_vector_dimension(base: &Path, requested: usize) -> HiveResult<usize> {
-    let meta_path = base.join(META_FILE);
-    if meta_path.exists() {
-        let raw = std::fs::read_to_string(&meta_path)?;
-        let meta: Value = serde_json::from_str(&raw).map_err(|e| {
-            crate::error::HiveError::InvalidInput(format!("corrupt {META_FILE}: {e}"))
-        })?;
-        let stored = meta
-            .get("vector_dimension")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| {
-                crate::error::HiveError::InvalidInput(format!(
-                    "corrupt {META_FILE}: missing vector_dimension"
-                ))
-            })? as usize;
-        if stored != requested {
-            return Err(crate::error::HiveError::InvalidInput(format!(
-                "database was created with vector_dimension={stored}, \
-                 cannot reopen with vector_dimension={requested}"
-            )));
-        }
-        Ok(stored)
-    } else {
-        let meta = serde_json::json!({ "vector_dimension": requested });
-        std::fs::write(&meta_path, meta.to_string())?;
-        Ok(requested)
-    }
+    /// Identidad explícita del espacio vectorial. `None` activa modo solo texto.
+    pub vector: Option<VectorOptions>,
 }
 
 /// Public handle to a HiveDB database.
@@ -209,12 +166,13 @@ impl HiveDB {
         let base = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&base)?;
 
-        let dimension = resolve_vector_dimension(&base, options.vector_dimension)?;
-
         let registry = default_registry();
         let log = LogHandle::Redb(Arc::new(EventLog::open(&base, registry, clock.clone())?));
         let working = Arc::new(WorkingMemory::new());
-        let semantic = Some(Arc::new(SemanticIndex::open(&base, dimension)?));
+        let semantic = Some(Arc::new(SemanticIndex::open(
+            &base,
+            options.vector.clone(),
+        )?));
         let collections = Some(Arc::new(Collections::open(&base)?));
         let reactive = Arc::new(ReactiveEngine::new());
 
@@ -390,6 +348,11 @@ impl HiveDB {
     /// Remove every document from the semantic index.
     pub fn clear_index(&self) -> HiveResult<()> {
         self.semantic()?.clear().map_err(Into::into)
+    }
+
+    /// Reconstruye ambos índices semánticos desde los documentos autoritativos.
+    pub fn compact_index(&self) -> HiveResult<()> {
+        self.semantic()?.compact().map_err(Into::into)
     }
 
     fn collections(&self) -> HiveResult<&Collections> {

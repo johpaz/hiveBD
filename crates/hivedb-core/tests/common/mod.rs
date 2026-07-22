@@ -1,11 +1,18 @@
 #![allow(dead_code)]
 
-use hivedb_core::{AgentId, EventInput, EventKind, HiveDB, StreamId};
+use hivedb_core::{AgentId, EventInput, EventKind, HiveDB, OpenOptions, StreamId, VectorOptions};
 use serde_json::json;
 use std::time::Duration;
 
 pub fn db() -> HiveDB {
     HiveDB::open_temp().expect("open temp db")
+}
+
+pub fn vector_db() -> HiveDB {
+    HiveDB::open_temp_with_options(OpenOptions {
+        vector: Some(VectorOptions::new(384, "test:384")),
+    })
+    .expect("open temp vector db")
 }
 
 pub fn value() -> serde_json::Value {

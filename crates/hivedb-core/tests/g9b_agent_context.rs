@@ -1,7 +1,15 @@
 use hivedb_core::{
-    AgentContextRequest, AnomalyConfig, ContextStrategy, EventInput, EventKind, HiveDB, StreamId,
+    AgentContextRequest, AnomalyConfig, ContextStrategy, EventInput, EventKind, HiveDB,
+    OpenOptions, StreamId, VectorOptions,
 };
 use serde_json::json;
+
+fn vector_db() -> HiveDB {
+    HiveDB::open_temp_with_options(OpenOptions {
+        vector: Some(VectorOptions::new(384, "test:384")),
+    })
+    .unwrap()
+}
 
 fn embed(text: &str) -> Vec<f32> {
     let mut v = vec![0.0; 384];
@@ -108,7 +116,7 @@ fn seed_task_with_outcome(
 
 #[test]
 fn build_context_never_exceeds_token_limit() {
-    let db = HiveDB::open_temp().unwrap();
+    let db = vector_db();
     seed_phase(&db, "task-1", "implementation", 10_000);
 
     let ctx = db
@@ -126,7 +134,7 @@ fn build_context_never_exceeds_token_limit() {
 
 #[test]
 fn causal_anchors_retrieves_distant_but_causally_connected_decisions() {
-    let db = HiveDB::open_temp().unwrap();
+    let db = vector_db();
 
     let anchor = db
         .append(decision("Architect", "no validar nulos en pagos", None))
@@ -159,7 +167,7 @@ fn causal_anchors_retrieves_distant_but_causally_connected_decisions() {
 
 #[test]
 fn completed_phases_are_compressed_not_dropped() {
-    let db = HiveDB::open_temp().unwrap();
+    let db = vector_db();
     seed_phase(&db, "task-1", "planning", 200);
     seed_phase(&db, "task-1", "implementation", 50);
 
@@ -184,7 +192,7 @@ fn completed_phases_are_compressed_not_dropped() {
 
 #[test]
 fn episodic_similarity_retrieves_past_relevant_episodes() {
-    let db = HiveDB::open_temp().unwrap();
+    let db = vector_db();
     seed_task_with_outcome(
         &db,
         "task-past-1",
@@ -228,7 +236,7 @@ fn episodic_similarity_retrieves_past_relevant_episodes() {
 
 #[test]
 fn recent_anomalies_always_included_in_context() {
-    let db = HiveDB::open_temp().unwrap();
+    let db = vector_db();
 
     for _ in 0..100 {
         db.append(decision("Backend", "step", None)).unwrap();
@@ -268,7 +276,7 @@ fn recent_anomalies_always_included_in_context() {
 
 #[test]
 fn build_context_is_idempotent() {
-    let db = HiveDB::open_temp().unwrap();
+    let db = vector_db();
     seed_phase(&db, "task-1", "implementation", 500);
 
     let req = AgentContextRequest {

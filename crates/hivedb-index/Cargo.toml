@@ -17,7 +17,12 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 bincode = { workspace = true }
 tempfile = "3"
+redb = { workspace = true }
 
 [[test]]
 name = "g4_semantic"
 path = "tests/g4_semantic.rs"
+
+[[test]]
+name = "g11_semantic_integrity"
+path = "tests/g11_semantic_integrity.rs"

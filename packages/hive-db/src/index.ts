@@ -7,6 +7,33 @@ const { JsHiveDb } = require("../native.cjs") as {
   };
 };
 
+export type HiveDBErrorCode =
+  | "INVALID_VECTOR"
+  | "VECTOR_SPACE_MISMATCH"
+  | "INDEX_DEGRADED";
+
+export class HiveDBError extends Error {
+  constructor(
+    public readonly code: HiveDBErrorCode,
+    message: string
+  ) {
+    super(message);
+    this.name = "HiveDBError";
+  }
+}
+
+function rethrowSemanticError(error: unknown): never {
+  const message = error instanceof Error ? error.message : String(error);
+  for (const code of [
+    "INVALID_VECTOR",
+    "VECTOR_SPACE_MISMATCH",
+    "INDEX_DEGRADED",
+  ] as const) {
+    if (message.includes(`${code}:`)) throw new HiveDBError(code, message);
+  }
+  throw error;
+}
+
 interface JsHiveDbInner {
   append(input: JsEventInput): Promise<number>;
   read(seq: number): Promise<JsEvent>;
@@ -26,6 +53,7 @@ interface JsHiveDbInner {
   deleteDoc(id: string): Promise<void>;
   deleteByFilter(filter: JsScalarFilter): Promise<void>;
   clearIndex(): Promise<void>;
+  compactIndex(): Promise<void>;
   colPut(collection: string, id: string, json: string, options?: JsPutOptions): Promise<number>;
   colGet(collection: string, id: string): Promise<JsDocEntry | null>;
   colDelete(collection: string, id: string): Promise<boolean>;
@@ -49,7 +77,7 @@ interface JsHiveDbInner {
 }
 
 interface JsOpenOptions {
-  vectorDimension?: number;
+  vector?: VectorOptions;
 }
 
 interface JsIndexDoc {
@@ -233,11 +261,15 @@ export interface ScalarFilter {
 }
 
 export interface OpenOptions {
-  /**
-   * Dimension of vectors accepted by the semantic index (default 384).
-   * Fixed at first open; reopening with a different value is an error.
-   */
-  vectorDimension?: number;
+  /** Omitir para usar BM25 en modo solo texto. */
+  vector?: VectorOptions;
+}
+
+export interface VectorOptions {
+  /** Dimensión del embedding, fija durante la vida de la base. */
+  dimension: number;
+  /** Identidad estable del modelo y configuración que produjo los vectores. */
+  spaceId: string;
 }
 
 /**
@@ -445,7 +477,11 @@ export class HiveDB {
    * ephemeral database that never touches persistent storage.
    */
   static async open(path: string, options?: OpenOptions): Promise<HiveDB> {
-    return new HiveDB(await JsHiveDb.open(path, options));
+    try {
+      return new HiveDB(await JsHiveDb.open(path, options));
+    } catch (error) {
+      rethrowSemanticError(error);
+    }
   }
 
   async append(input: EventInput): Promise<number> {
@@ -516,12 +552,20 @@ export class HiveDB {
     vector: Float32Array,
     filters?: ScalarFilter[]
   ): Promise<void> {
-    return this.inner.indexDoc(id, text, vector, filters);
+    try {
+      await this.inner.indexDoc(id, text, vector, filters);
+    } catch (error) {
+      rethrowSemanticError(error);
+    }
   }
 
   /** Insert or replace a document in the semantic index. */
   async upsertDoc(doc: IndexDoc): Promise<void> {
-    return this.inner.upsertDoc(doc);
+    try {
+      await this.inner.upsertDoc(doc);
+    } catch (error) {
+      rethrowSemanticError(error);
+    }
   }
 
   /**
@@ -529,7 +573,11 @@ export class HiveDB {
    * Much faster than repeated `upsertDoc` calls.
    */
   async upsertBatch(docs: IndexDoc[]): Promise<void> {
-    return this.inner.upsertBatch(docs);
+    try {
+      await this.inner.upsertBatch(docs);
+    } catch (error) {
+      rethrowSemanticError(error);
+    }
   }
 
   /** Delete a document from the semantic index. Missing ids are a no-op. */
@@ -545,6 +593,15 @@ export class HiveDB {
   /** Remove every document from the semantic index. */
   async clearIndex(): Promise<void> {
     return this.inner.clearIndex();
+  }
+
+  /** Reconstruye ambos índices desde el almacén autoritativo. */
+  async compactIndex(): Promise<void> {
+    try {
+      await this.inner.compactIndex();
+    } catch (error) {
+      rethrowSemanticError(error);
+    }
   }
 
   /** Typed handle to a named document collection. */
@@ -573,7 +630,11 @@ export class HiveDB {
   }
 
   async queryHybrid(query: HybridQuery): Promise<Hit[]> {
-    return this.inner.queryHybrid(query);
+    try {
+      return await this.inner.queryHybrid(query);
+    } catch (error) {
+      rethrowSemanticError(error);
+    }
   }
 
   subscribe(pattern: EventPattern, onEvent: (event: Event) => void): Subscription {

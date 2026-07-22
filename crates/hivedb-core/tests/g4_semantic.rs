@@ -1,6 +1,6 @@
 mod common;
 
-use common::db;
+use common::vector_db as db;
 use hivedb_core::{HybridQuery, ScalarFilter};
 
 fn embed(text: &str) -> Vec<f32> {

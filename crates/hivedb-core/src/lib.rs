@@ -19,7 +19,7 @@ pub mod state;
 
 pub use clock::{Clock, MockClock, SystemClock};
 pub use collections::{ColOp, Collections, DocEntry, PutOptions, ScanOptions};
-pub use db::{Decision, HiveDB, OpenOptions};
+pub use db::{Decision, HiveDB, OpenOptions, VectorOptions};
 pub use error::{HiveError, HiveResult};
 pub use event::{AgentId, Event, EventInput, EventKind, EventKindTag, Scope, StreamId};
 pub use projection::Projection;

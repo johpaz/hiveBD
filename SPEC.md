@@ -441,6 +441,7 @@ hivedb/
 | 9 (G9) | Harness de larga duración: `CausalThread`, `buildAgentContext`, `HarnessLoop` (§9) | TDD §5.1-§5.4 |
 | 10 (G10) | Distribución multiplataforma con `@napi-rs/cli` (6 targets) | CI de release |
 | 11 (G11) | Colecciones de documentos: CRUD versionado, índices secundarios, batches atómicos | §4.4 (colecciones) |
+| 11b (G11b) | Integridad semántica: fuente autoritativa, espacio vectorial, filtros exactos y compactación | TDD G11b |
 
 Cada fase: **rojo → verde → refactor.** No se pasa de fase sin el gate verde.
 

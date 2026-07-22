@@ -11,7 +11,7 @@ pub use hnsw::VectorIndex;
 pub use index::SemanticIndex;
 pub use rrf::rrf;
 pub use text::TextIndex;
-pub use types::{FieldBoosts, Fusion, Hit, HybridQuery, IndexDoc, ScalarFilter};
+pub use types::{FieldBoosts, Fusion, Hit, HybridQuery, IndexDoc, ScalarFilter, VectorConfig};
 
 /// Result type used across `hivedb-index`.
 pub type Result<T> = std::result::Result<T, IndexError>;
@@ -28,11 +28,31 @@ pub enum IndexError {
     #[error("tantivy query parser error: {0}")]
     QueryParser(#[from] tantivy::query::QueryParserError),
 
-    #[error("hnsw dimension mismatch: expected {expected}, got {got}")]
+    #[error("INVALID_VECTOR: dimension mismatch: expected {expected}, got {got}")]
     DimensionMismatch { expected: usize, got: usize },
+
+    #[error("INVALID_VECTOR: {0}")]
+    InvalidVector(String),
+
+    #[error("INVALID_VECTOR: open the database with an explicit vector configuration")]
+    VectorIndexDisabled,
+
+    #[error("VECTOR_SPACE_MISMATCH: {0}")]
+    VectorSpaceMismatch(String),
+
+    #[error(
+        "INDEX_DEGRADED: generation {generation} was committed but indexes could not be rebuilt: {cause}"
+    )]
+    IndexUnavailableAfterCommit { generation: u64, cause: String },
+
+    #[error("semantic storage error: {0}")]
+    Storage(String),
 
     #[error("serialization error: {0}")]
     Serialization(#[from] Box<bincode::ErrorKind>),
+
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
 
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),

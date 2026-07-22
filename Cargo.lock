@@ -648,7 +648,7 @@ checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
 name = "hivedb-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "bincode",
  "dashmap",
@@ -667,10 +667,11 @@ dependencies = [
 
 [[package]]
 name = "hivedb-index"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "bincode",
  "hnsw_rs",
+ "redb",
  "serde",
  "serde_json",
  "tantivy",
@@ -681,7 +682,7 @@ dependencies = [
 
 [[package]]
 name = "hivedb-napi"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "hivedb-core",
  "hivedb-index",

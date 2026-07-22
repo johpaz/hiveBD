@@ -73,5 +73,9 @@ path = "tests/g9c_harness.rs"
 name = "g9d_e2e"
 path = "tests/g9d_e2e.rs"
 
+[[test]]
+name = "g11_semantic_integrity"
+path = "tests/g11_semantic_integrity.rs"
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

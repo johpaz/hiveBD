@@ -1,4 +1,8 @@
-use hivedb_index::{FieldBoosts, HybridQuery, IndexDoc, ScalarFilter, SemanticIndex};
+use hivedb_index::{FieldBoosts, HybridQuery, IndexDoc, ScalarFilter, SemanticIndex, VectorConfig};
+
+fn open_index(path: &std::path::Path) -> SemanticIndex {
+    SemanticIndex::open(path, Some(VectorConfig::new(384, "test:384"))).unwrap()
+}
 
 fn embed(text: &str) -> Vec<f32> {
     let mut v = vec![0.0; 384];
@@ -31,7 +35,7 @@ fn doc(id: &str, body: &str) -> IndexDoc {
 #[test]
 fn hybrid_query_fuses_text_and_vector() {
     let dir = tempfile::tempdir().unwrap();
-    let index = SemanticIndex::open(dir.path(), 384).unwrap();
+    let index = open_index(dir.path());
 
     index
         .upsert(&doc("doc1", "error de compilación en pagos").with_vector(embed("pago fallido")))
@@ -59,7 +63,7 @@ fn hybrid_query_fuses_text_and_vector() {
 #[test]
 fn scalar_filters_pushed_into_index() {
     let dir = tempfile::tempdir().unwrap();
-    let index = SemanticIndex::open(dir.path(), 384).unwrap();
+    let index = open_index(dir.path());
 
     index
         .upsert(
@@ -94,7 +98,7 @@ fn vector_index_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
 
     {
-        let index = SemanticIndex::open(dir.path(), 384).unwrap();
+        let index = open_index(dir.path());
         index
             .upsert(&doc("doc1", "torre eiffel en parís").with_vector(embed("pago")))
             .unwrap();
@@ -104,7 +108,7 @@ fn vector_index_survives_reopen() {
     }
 
     // Reopen from disk: the ANN index must be rebuilt from persisted vectors.
-    let index = SemanticIndex::open(dir.path(), 384).unwrap();
+    let index = open_index(dir.path());
     let hits = index
         .query_hybrid(HybridQuery::default().with_vector(embed("pago")).with_k(1))
         .unwrap();
@@ -116,7 +120,7 @@ fn vector_index_survives_reopen() {
 #[test]
 fn scalar_filters_work_on_arbitrary_fields() {
     let dir = tempfile::tempdir().unwrap();
-    let index = SemanticIndex::open(dir.path(), 384).unwrap();
+    let index = open_index(dir.path());
 
     index
         .upsert(
@@ -149,7 +153,7 @@ fn scalar_filters_work_on_arbitrary_fields() {
 #[test]
 fn hit_has_positive_score() {
     let dir = tempfile::tempdir().unwrap();
-    let index = SemanticIndex::open(dir.path(), 384).unwrap();
+    let index = open_index(dir.path());
 
     index.upsert(&doc("doc1", "hello world")).unwrap();
 
@@ -166,7 +170,7 @@ fn hit_has_positive_score() {
 #[test]
 fn spanish_stemming_matches_morphological_variants() {
     let dir = tempfile::tempdir().unwrap();
-    let index = SemanticIndex::open(dir.path(), 384).unwrap();
+    let index = open_index(dir.path());
 
     index
         .upsert(&doc("d1", "procesa el pago de la factura"))
@@ -183,7 +187,7 @@ fn spanish_stemming_matches_morphological_variants() {
 #[test]
 fn accent_folding_matches_both_directions() {
     let dir = tempfile::tempdir().unwrap();
-    let index = SemanticIndex::open(dir.path(), 384).unwrap();
+    let index = open_index(dir.path());
 
     index
         .upsert(&doc("d1", "transacción rechazada por el banco"))
@@ -210,7 +214,7 @@ fn accent_folding_matches_both_directions() {
 #[test]
 fn malformed_query_never_fails() {
     let dir = tempfile::tempdir().unwrap();
-    let index = SemanticIndex::open(dir.path(), 384).unwrap();
+    let index = open_index(dir.path());
 
     index.upsert(&doc("d1", "envía el correo")).unwrap();
 
@@ -243,7 +247,7 @@ fn malformed_query_never_fails() {
 #[test]
 fn name_field_boost_ranks_title_matches_first() {
     let dir = tempfile::tempdir().unwrap();
-    let index = SemanticIndex::open(dir.path(), 384).unwrap();
+    let index = open_index(dir.path());
 
     index
         .upsert(
@@ -287,7 +291,7 @@ fn name_field_boost_ranks_title_matches_first() {
 #[test]
 fn upsert_replaces_document() {
     let dir = tempfile::tempdir().unwrap();
-    let index = SemanticIndex::open(dir.path(), 384).unwrap();
+    let index = open_index(dir.path());
 
     index.upsert(&doc("d1", "contenido de pagos")).unwrap();
     index.upsert(&doc("d1", "contenido de envíos")).unwrap();
@@ -306,7 +310,7 @@ fn upsert_replaces_document() {
 #[test]
 fn delete_removes_text_and_vector() {
     let dir = tempfile::tempdir().unwrap();
-    let index = SemanticIndex::open(dir.path(), 384).unwrap();
+    let index = open_index(dir.path());
 
     index
         .upsert(&doc("d1", "pago fallido").with_vector(embed("pago")))
@@ -332,7 +336,7 @@ fn delete_removes_text_and_vector() {
 
     // Deletion survives a reopen (tombstone is persisted).
     drop(index);
-    let index = SemanticIndex::open(dir.path(), 384).unwrap();
+    let index = open_index(dir.path());
     let hits = index
         .query_hybrid(HybridQuery::default().with_vector(embed("pago")).with_k(5))
         .unwrap();
@@ -342,7 +346,7 @@ fn delete_removes_text_and_vector() {
 #[test]
 fn delete_by_filter_removes_matching_docs() {
     let dir = tempfile::tempdir().unwrap();
-    let index = SemanticIndex::open(dir.path(), 384).unwrap();
+    let index = open_index(dir.path());
 
     for i in 0..3 {
         index
@@ -384,7 +388,7 @@ fn delete_by_filter_removes_matching_docs() {
 #[test]
 fn clear_empties_the_index() {
     let dir = tempfile::tempdir().unwrap();
-    let index = SemanticIndex::open(dir.path(), 384).unwrap();
+    let index = open_index(dir.path());
 
     index
         .upsert(&doc("d1", "algo de texto").with_vector(embed("x")))
@@ -403,7 +407,7 @@ fn clear_empties_the_index() {
 
     // Clear survives reopen (persistence file was truncated).
     drop(index);
-    let index = SemanticIndex::open(dir.path(), 384).unwrap();
+    let index = open_index(dir.path());
     let hits = index
         .query_hybrid(HybridQuery::default().with_vector(embed("x")).with_k(5))
         .unwrap();
@@ -413,7 +417,7 @@ fn clear_empties_the_index() {
 #[test]
 fn batch_upsert_indexes_all_docs() {
     let dir = tempfile::tempdir().unwrap();
-    let index = SemanticIndex::open(dir.path(), 384).unwrap();
+    let index = open_index(dir.path());
 
     let docs: Vec<IndexDoc> = (0..50)
         .map(|i| {
@@ -436,7 +440,7 @@ fn batch_upsert_indexes_all_docs() {
 #[test]
 fn text_only_docs_coexist_with_vector_queries() {
     let dir = tempfile::tempdir().unwrap();
-    let index = SemanticIndex::open(dir.path(), 384).unwrap();
+    let index = open_index(dir.path());
 
     index
         .upsert(&doc("text-only", "solo texto sin vector"))
@@ -466,7 +470,7 @@ fn text_only_docs_coexist_with_vector_queries() {
 #[test]
 fn vector_only_query_respects_filters() {
     let dir = tempfile::tempdir().unwrap();
-    let index = SemanticIndex::open(dir.path(), 384).unwrap();
+    let index = open_index(dir.path());
 
     index
         .upsert(
@@ -500,7 +504,7 @@ fn vector_only_query_respects_filters() {
 #[test]
 fn single_source_scores_are_raw() {
     let dir = tempfile::tempdir().unwrap();
-    let index = SemanticIndex::open(dir.path(), 384).unwrap();
+    let index = open_index(dir.path());
 
     index
         .upsert(&doc("d1", "pago fallido").with_vector(embed("pago")))
@@ -531,7 +535,7 @@ fn single_source_scores_are_raw() {
 
 #[test]
 fn in_ram_index_supports_full_lifecycle() {
-    let index = SemanticIndex::open_in_ram(384).unwrap();
+    let index = SemanticIndex::open_in_ram(Some(VectorConfig::new(384, "test:384"))).unwrap();
 
     index
         .upsert(&doc("d1", "transacción rechazada").with_vector(embed("transacción")))

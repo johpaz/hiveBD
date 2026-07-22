@@ -55,7 +55,8 @@ crates/hivedb-core/tests/
 ├── g4_semantic.rs
 ├── g5_reactive.rs
 ├── g6_consent.rs
-└── g7_concurrency.rs
+├── g7_concurrency.rs
+└── g11_semantic_integrity.rs
 ```
 
 ## Convenciones

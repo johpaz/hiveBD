@@ -191,7 +191,18 @@ await db.upsertDoc({
 await db.upsertBatch(docs);
 ```
 
-El vector es opcional: los documentos solo-texto nunca tocan el índice vectorial. Cuando incluyas vectores, la dimensión (384 por defecto) se fija en el primer `open` y puede configurarse: `HiveDB.open(path, { vectorDimension: 768 })`.
+El vector es opcional y se genera fuera de HiveDB. Para usarlo debes declarar explícitamente un espacio estable al abrir; omitir `vector` deja la base en modo texto:
+
+```ts
+const db = await HiveDB.open("./data", {
+  vector: {
+    dimension: 768,
+    spaceId: "my-embedding-space-v1",
+  },
+});
+```
+
+Documentos y consultas deben producirse con el mismo modelo y configuración representados por `spaceId`. HiveDB rechaza dimensiones distintas, NaN, infinitos y vectores de norma cero.
 
 ### Consultar
 
@@ -213,7 +224,7 @@ Puedes consultar solo por texto, solo por vector, o ambos. La semántica del `sc
 | Modo | `score` |
 |---|---|
 | Solo texto | BM25 crudo (positivo, mayor = mejor) |
-| Solo vector | Similitud coseno (0-1) |
+| Solo vector | Similitud coseno (-1 a 1) |
 | Híbrido | Fusión RRF (`fusion: { kind: "rrf", k: 60 }` configurable); `textScore` y `vectorScore` traen los componentes crudos |
 
 El parsing del texto es tolerante: comillas sin cerrar, operadores y signos de puntuación degradan a una búsqueda bolsa-de-palabras en lugar de fallar.
@@ -224,6 +235,7 @@ El parsing del texto es tolerante: comillas sin cerrar, operadores y signos de p
 await db.deleteDoc("tool:send_email");                       // por id
 await db.deleteByFilter({ field: "server_id", value: "a" }); // por filtro (p. ej. hot-reload MCP)
 await db.clearIndex();                                       // vaciar todo el índice
+await db.compactIndex();                                     // reconstruir índices derivados
 ```
 
 `HiveDB.open(":memory:")` abre una base efímera (ideal para tests) con el índice semántico completo.
@@ -458,7 +470,7 @@ interface IndexDoc {
   name?: string;   // boost 4.0
   body?: string;   // boost 2.0
   tags?: string;   // boost 3.0
-  vector?: Float32Array; // dimensión configurable (default 384)
+  vector?: Float32Array; // requiere configuración vectorial explícita al abrir
   filters?: ScalarFilter[];
 }
 
@@ -521,7 +533,9 @@ class Collection<T = unknown> {
 }
 
 class HiveDB {
-  static open(path: string, options?: { vectorDimension?: number }): Promise<HiveDB>;
+  static open(path: string, options?: {
+    vector?: { dimension: number; spaceId: string };
+  }): Promise<HiveDB>;
   append(input: EventInput): Promise<number>;
   read(seq: number): Promise<Event>;
   logLen(): Promise<number>;
@@ -532,6 +546,7 @@ class HiveDB {
   deleteByFilter(filter: ScalarFilter): Promise<void>;
   clearIndex(): Promise<void>;
   indexDoc(id: string, text: string, vector: Float32Array, filters?: ScalarFilter[]): Promise<void>; // deprecado
+  compactIndex(): Promise<void>;
   queryHybrid(query: HybridQuery): Promise<Hit[]>;
   events(pattern: EventPattern): AsyncIterable<Event> & { close(): void };
   subscribe(pattern: EventPattern, onEvent: (event: Event) => void): Subscription;

@@ -18,7 +18,9 @@ Incluye binarios precompilados para Linux x64 (glibc y musl), Linux arm64, macOS
 ```ts
 import { HiveDB } from "@johpaz/hive-db";
 
-const db = await HiveDB.open("./data/my-agent");
+const db = await HiveDB.open("./data/my-agent", {
+  vector: { dimension: 768, spaceId: "my-model:768:retrieval-v1" },
+});
 
 // Event-log: única vía de escritura, seq asignado por el motor
 const seq = await db.append({

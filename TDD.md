@@ -672,6 +672,7 @@ Cada fase del roadmap del SPEC tiene un gate. CI no permite merge a `main` sin e
 | G6 Consent | §4.9, §4.9b, §4.9c, §4.9d, §4.9e, §4.9f, §4.9g |
 | G7 Concurrencia | §4.10, §4.10b, §4.10c |
 | G8 Bun/FFI | §4.11, §4.11b, §4.11c, §4.11d, §4.13 |
+| G11b Integridad semántica | `g11_semantic_integrity.rs` + `g11_semantic_integrity.test.ts` |
 
 **Orden de ataque recomendado:** G1 → G2 son el corazón (event sourcing). Si esos dos están sólidos y con replay determinista probado por property test, el resto se construye encima con confianza. No optimices nada hasta que G1+G2 estén verdes y refactorizados.
 
@@ -1194,3 +1195,15 @@ fn harness_loop_improves_across_similar_tasks() {
 **Dependencias de gate:** G9 requiere G1+G2 verdes (event-log y proyecciones). G9b requiere G4 verde (búsqueda híbrida, porque `episodic_similarity` la usa). G9c requiere G9a verde.
 
 **Nota de implementación:** `HarnessLoop::evaluate` es una función pura en Rust — recibe datos, devuelve evaluación, sin side effects. Los side effects (persistir proposals al log) son responsabilidad del llamador, no del evaluador. Esto hace §5.3a-§5.3f testeables sin mock del motor.
+
+---
+
+## Gate G11b — Integridad del índice semántico
+
+- Rechaza dimensión inválida, NaN, infinitos, norma cero y `k = 0` antes de confirmar documentos.
+- El modo sin configuración vectorial admite BM25 y rechaza cualquier vector.
+- `spaceId`, dimensión y métrica son inmutables por base.
+- Los filtros vectoriales devuelven exactamente el top-k del conjunto permitido.
+- Upserts concurrentes sobre el mismo id nunca mezclan texto y vector de generaciones distintas.
+- Reapertura y `compactIndex()` reconstruyen Tantivy/HNSW desde documentos vivos en `semantic.redb`.
+- La capa Bun conserva códigos `INVALID_VECTOR`, `VECTOR_SPACE_MISMATCH` e `INDEX_DEGRADED`.

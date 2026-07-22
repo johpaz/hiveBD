@@ -154,17 +154,27 @@ No expongas `seq` ni `timestamp` en `EventInput`. Hay un test `compile_fail` (`t
 | `rrf.rs` | Fusión Reciprocal Rank. |
 | `index.rs` | `SemanticIndex` orquesta text + vector + RRF. |
 
-### Dimensión vectorial
+### Espacio vectorial
 
-Configurable por base vía `OpenOptions { vector_dimension }` (default 384 si no se especifica). `db.rs::resolve_vector_dimension()` la persiste en `meta.json` al crear la base y valida que coincida en cada `open` posterior — reabrir con una dimensión distinta falla con un error explícito en vez de corromper el índice.
+La búsqueda vectorial se activa explícitamente mediante `OpenOptions { vector: Some(VectorOptions { dimension, space_id }) }`. Sin configuración, la base funciona en modo BM25 y rechaza vectores. `meta.json` persiste versión de esquema, dimensión, `space_id` y métrica coseno; cualquier diferencia al reabrir falla con `VECTOR_SPACE_MISMATCH`.
 
-### Persistencia de vectores
+### Persistencia, reconstrucción y compactación
 
-`VectorIndex` persiste cada `(id, vector)` en un archivo append-only `vec/vectors.bin` (bincode) y reconstruye el grafo HNSW al abrir. Un registro final truncado (crash a mitad de escritura) se descarta recortando el archivo al último registro completo.
+`semantic.redb` es la fuente de verdad de cada `IndexDoc` completo. Tantivy y HNSW son índices derivados: al abrir se reconstruyen desde documentos vivos, por lo que una reapertura nunca depende de un log vectorial parcialmente actualizado. Las mutaciones están serializadas por un `RwLock` de operación y aumentan una generación dentro de la misma transacción `redb`.
+
+HNSW conserva tombstones solo en RAM. Se reconstruye automáticamente cuando hay al menos 1.024 tombstones y representan 25% de los nodos, o manualmente mediante `compact_index()` / `compactIndex()`.
+
+El benchmark reproducible del gate se ejecuta con:
+
+```bash
+cargo run -p hivedb-index --release --example g11_semantic_benchmark
+```
+
+Línea base local del 2026-07-16, build `--release` (no es un umbral de CI): ingestión 10k `988 ms`, consulta HNSW `214 µs`, filtro exacto `5.583 ms`, compactación `997 ms` y reapertura `870 ms`.
 
 ### Filtros escalares
 
-Actualmente solo `ScalarFilter::Eq { field, value }`, sobre **cualquier campo**. Cada filtro se indexa como token `campo\u{1F}valor` en un campo `STRING` multivalor de `tantivy` y se aplica como `TermQuery` obligatorio antes del ranking.
+Actualmente solo `ScalarFilter::Eq { field, value }`, sobre **cualquier campo**. Cada filtro se indexa como token `campo\u{1F}valor` en un campo `STRING` multivalor de `tantivy`. En consultas vectoriales, Tantivy obtiene la allowlist y el motor calcula coseno exacto sobre esos vectores, garantizando los mejores `min(k, permitidos)` sin post-filter de recall limitado.
 
 ### Añadir una nueva estrategia de fusión
 

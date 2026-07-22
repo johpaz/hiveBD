@@ -22,7 +22,9 @@ describe("G8 napi-rs binding", () => {
 
   beforeEach(async () => {
     base = tempDir("hive-g8-");
-    db = await HiveDB.open(base);
+    db = await HiveDB.open(base, {
+      vector: { dimension: VECTOR_DIMENSION, spaceId: "test:384" },
+    });
   });
 
   afterEach(() => {
@@ -264,7 +266,9 @@ describe("G8 napi-rs binding", () => {
 
   it("§4.12f vector dimension is configurable at open", async () => {
     const dir = tempDir("hive-g8-dim-");
-    const small = await HiveDB.open(dir, { vectorDimension: 8 });
+    const small = await HiveDB.open(dir, {
+      vector: { dimension: 8, spaceId: "test:8" },
+    });
     try {
       const v = new Float32Array(8);
       v[0] = 1;
@@ -282,9 +286,9 @@ describe("G8 napi-rs binding", () => {
     const dir2 = tempDir("hive-g8-dim2-");
     try {
       await expect(async () => {
-        const a = await HiveDB.open(dir2, { vectorDimension: 8 });
+        const a = await HiveDB.open(dir2, { vector: { dimension: 8, spaceId: "test:8" } });
         a.close();
-        await HiveDB.open(dir2, { vectorDimension: 16 });
+        await HiveDB.open(dir2, { vector: { dimension: 16, spaceId: "test:16" } });
       }).toThrow();
     } finally {
       rmSync(dir2, { recursive: true, force: true });

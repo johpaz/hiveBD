@@ -98,6 +98,7 @@ motor SQL genérico.
 - ✅ G9: Harness de larga duración (`CausalThread`, `buildAgentContext`, `HarnessLoop`): memoria causal de tareas, ventanas de contexto adaptativas y evaluación de proceso.
 - ✅ G10: Distribución multiplataforma con `@napi-rs/cli` (6 targets: linux x64 gnu/musl, linux arm64, macOS x64/arm64, Windows x64).
 - ✅ G11: Colecciones de documentos (CRUD mutable sobre `redb`): versionado optimista, índices secundarios de igualdad (con `unique`), scan con prefijo/orden/limit y batches atómicos multi-colección.
+- ✅ G11b: Integridad semántica: documentos autoritativos en `redb`, espacio vectorial explícito, validación estricta, filtros exactos y compactación HNSW.
 
 > Nota sobre numeración: los tests de colecciones se llaman `g9_collections.rs`/`g9_collections.test.ts` por una colisión histórica con la numeración del README; el gate funcional de colecciones es G11.
 

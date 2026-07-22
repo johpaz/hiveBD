@@ -33,7 +33,7 @@ impl Default for Fusion {
 }
 
 /// Scalar filter pushed down to the underlying index.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ScalarFilter {
     /// Equality filter on a string field.
     Eq { field: String, value: String },
@@ -71,7 +71,7 @@ impl Default for FieldBoosts {
 /// All text slots are optional; a document with no text fields is still
 /// registered (id + filters) so it can be filtered and deleted. `vector` is
 /// optional: text-only documents never touch the vector index.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct IndexDoc {
     pub id: String,
     /// Short, high-signal title (boosted highest by default).
@@ -84,6 +84,22 @@ pub struct IndexDoc {
     pub vector: Option<Vec<f32>>,
     /// Scalar filters attached to the document.
     pub filters: Vec<ScalarFilter>,
+}
+
+/// Identidad inmutable del espacio de embeddings usado por una base.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VectorConfig {
+    pub dimension: usize,
+    pub space_id: String,
+}
+
+impl VectorConfig {
+    pub fn new(dimension: usize, space_id: impl Into<String>) -> Self {
+        Self {
+            dimension,
+            space_id: space_id.into(),
+        }
+    }
 }
 
 impl IndexDoc {

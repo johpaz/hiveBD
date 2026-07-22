@@ -1,6 +1,7 @@
 use hivedb_core::{
     AgentContextRequest, AgentId, ColOp, Decision, DocEntry, EventInput, EventKind, EventPattern,
     HarnessInput, HarnessLoop, HiveDB, OpenOptions, PutOptions, ScanOptions, StreamId, ToolStats,
+    VectorOptions,
 };
 use hivedb_index::{FieldBoosts, Fusion, Hit as CoreHit, HybridQuery, IndexDoc, ScalarFilter};
 use napi::bindgen_prelude::*;
@@ -101,10 +102,15 @@ pub struct JsIndexDoc {
 }
 
 #[napi(object)]
+pub struct JsVectorOptions {
+    pub dimension: u32,
+    pub space_id: String,
+}
+
+#[napi(object)]
 pub struct JsOpenOptions {
-    /// Dimension of vectors accepted by the semantic index (default 384).
-    /// Fixed at first open; reopening with a different value is an error.
-    pub vector_dimension: Option<u32>,
+    /// Omitir para usar el modo solo texto.
+    pub vector: Option<JsVectorOptions>,
 }
 
 #[napi(object)]
@@ -485,10 +491,9 @@ impl JsHiveDB {
     #[napi(factory)]
     pub async fn open(path: String, options: Option<JsOpenOptions>) -> Result<Self> {
         let open_options = OpenOptions {
-            vector_dimension: options
-                .and_then(|o| o.vector_dimension)
-                .map(|d| d as usize)
-                .unwrap_or(OpenOptions::default().vector_dimension),
+            vector: options
+                .and_then(|o| o.vector)
+                .map(|vector| VectorOptions::new(vector.dimension as usize, vector.space_id)),
         };
         // ":memory:" opens an ephemeral database backed by a process-lifetime
         // temporary directory, so tests never touch persistent storage.
@@ -678,6 +683,12 @@ impl JsHiveDB {
     #[napi]
     pub async fn clear_index(&self) -> Result<()> {
         self.with_db(|db| db.clear_index().map_err(js_err))
+    }
+
+    /// Reconstruye los índices semánticos desde sus documentos autoritativos.
+    #[napi]
+    pub async fn compact_index(&self) -> Result<()> {
+        self.with_db(|db| db.compact_index().map_err(js_err))
     }
 
     /// Insert or replace a JSON document in a collection. Returns the new
