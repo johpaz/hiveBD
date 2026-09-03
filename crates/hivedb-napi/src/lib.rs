@@ -535,10 +535,25 @@ impl JsHiveDB {
         self.with_db(|db| db.last_seq().map_err(js_err).map(|seq| seq as i64))
     }
 
+    /// Estadísticas agregadas de una herramienta.
+    ///
+    /// `ToolLedger` tiene scope `Agent`: sin `agents`, la proyección mezcla el
+    /// estado de todos los shards de la base y suma las llamadas de todos los
+    /// inquilinos. Pasar la lista es obligatorio en un despliegue compartido.
     #[napi(js_name = "toolStats")]
-    pub async fn tool_stats(&self, tool: String) -> Result<Option<JsToolStats>> {
+    pub async fn tool_stats(
+        &self,
+        tool: String,
+        agents: Option<Vec<String>>,
+    ) -> Result<Option<JsToolStats>> {
         self.with_db(|db| {
-            let stats = db.tool_stats(&tool).map_err(js_err)?;
+            let stats = match agents {
+                Some(ref ids) => {
+                    let ids: Vec<AgentId> = ids.iter().cloned().map(AgentId::from).collect();
+                    db.tool_stats_for_agents(&tool, &ids).map_err(js_err)?
+                }
+                None => db.tool_stats(&tool).map_err(js_err)?,
+            };
             Ok(stats.map(tool_stats_to_js))
         })
     }
@@ -600,10 +615,26 @@ impl JsHiveDB {
     }
 
     /// Build the causal thread for a task as a JSON string.
+    /// Hilo causal de un stream.
+    ///
+    /// `agents` acota la búsqueda a esos agentes. Omitirlo recorre el log de
+    /// toda la base, que es lo correcto cuando la base tiene un solo dueño y
+    /// una fuga cuando la comparten varios inquilinos.
     #[napi(js_name = "causalThread")]
-    pub async fn causal_thread(&self, stream_id: String) -> Result<String> {
+    pub async fn causal_thread(
+        &self,
+        stream_id: String,
+        agents: Option<Vec<String>>,
+    ) -> Result<String> {
         self.with_db(|db| {
-            let thread = db.causal_thread(stream_id).map_err(js_err)?;
+            let thread = match agents {
+                Some(ref ids) => {
+                    let ids: Vec<AgentId> = ids.iter().cloned().map(AgentId::from).collect();
+                    db.causal_thread_for_agents(stream_id, &ids)
+                        .map_err(js_err)?
+                }
+                None => db.causal_thread(stream_id).map_err(js_err)?,
+            };
             serde_json::to_string(&thread)
                 .map_err(|e| Error::from_reason(format!("serialization error: {e}")))
         })

@@ -240,6 +240,7 @@ fn generic_consumer_context_budget_and_phase_compression() {
 
     let ctx = db
         .build_agent_context(AgentContextRequest {
+            agents: Vec::new(),
             task_id: TICKET.into(),
             current_phase: "resolution".into(),
             current_objective: "".into(),

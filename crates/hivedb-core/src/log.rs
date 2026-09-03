@@ -5,14 +5,26 @@ use crate::projection::{
     EventLogInternal, Projection, ProjectionRegistry, ProjectionScope, ProjectionStore,
 };
 use crate::shard::AgentShard;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use redb::{ReadableTable, TableDefinition};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 const SHARDS_DIR: &str = "shards";
 const GLOBAL_SHARD: &str = "_global.redb";
+
+/// Cuántos shards se mantienen abiertos a la vez. Cada shard es una
+/// `redb::Database`, o sea un descriptor y una región mmap: una base compartida
+/// por muchos enjambres acumula miles y se come el `ulimit -n` del proceso.
+const DEFAULT_MAX_OPEN_SHARDS: usize = 256;
+
+/// Clave en la tabla `meta` del shard global: marca si la última sesión cerró
+/// ordenadamente. Si no, `next_seq` puede estar atrasado —los eventos no
+/// globales no lo persisten, justo para no serializar todas las escrituras
+/// contra el shard global— y hay que redescubrirlo escaneando.
+const CLEAN_SHUTDOWN_KEY: &str = "clean_shutdown";
 
 const EVENTS_TABLE: TableDefinition<u64, Vec<u8>> = TableDefinition::new("events");
 const PROJECTION_CHECKPOINTS: TableDefinition<&str, u64> =
@@ -23,11 +35,24 @@ const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("meta");
 /// Internal sharded event-log implementation on top of `redb`.
 pub(crate) struct EventLog {
     base: PathBuf,
+    /// Caché acotada de shards ABIERTOS, no el censo de los que existen.
     shards: DashMap<AgentId, Arc<AgentShard>>,
+    /// Orden de apertura, para desalojar el más antiguo cuando se llena.
+    open_order: Mutex<VecDeque<AgentId>>,
+    max_open_shards: usize,
+    /// Censo de agentes con shard en disco. Se llena al abrir leyendo sólo los
+    /// NOMBRES de fichero del directorio —sin abrir ninguna base ni leer un
+    /// solo evento— y crece cuando nace un agente nuevo.
+    known_agents: DashSet<AgentId>,
+    /// Shards cuyas proyecciones ya se recuperaron en esta sesión.
+    recovered: DashSet<AgentId>,
     global: AgentShard,
     registry: ProjectionRegistry,
     clock: Arc<dyn Clock>,
     next_seq: AtomicU64,
+    /// Índice seq → agente para `read(seq)`. Se puebla sobre la marcha (al
+    /// escribir, y al escanear en una recuperación sucia): ya no se reconstruye
+    /// leyendo el log entero en cada apertura.
     seq_to_agent: DashMap<u64, AgentId>,
 }
 
@@ -47,6 +72,10 @@ impl EventLog {
         let log = Self {
             base,
             shards: DashMap::new(),
+            open_order: Mutex::new(VecDeque::new()),
+            max_open_shards: DEFAULT_MAX_OPEN_SHARDS,
+            known_agents: DashSet::new(),
+            recovered: DashSet::new(),
             global,
             registry,
             clock,
@@ -54,8 +83,13 @@ impl EventLog {
             seq_to_agent: DashMap::new(),
         };
 
-        log.load_existing_shards()?;
-        log.recover_projections()?;
+        // Abrir la base ya no cuesta O(eventos totales): se listan los nombres
+        // de los shards y se lee el contador persistido. Los shards se abren y
+        // se recuperan uno a uno, la primera vez que alguien los toca.
+        log.census_shards()?;
+        log.restore_next_seq()?;
+        log.mark_dirty()?;
+        log.recover_global_projections()?;
         Ok(log)
     }
 
@@ -72,21 +106,98 @@ impl EventLog {
         self.shards_dir().join(format!("{}.redb", name))
     }
 
+    /// Abre el shard de un agente, creándolo si hace falta.
+    ///
+    /// La entrada del `DashMap` se toma antes de tocar el disco: sin eso, dos
+    /// hilos podrían intentar abrir el mismo fichero a la vez y el segundo
+    /// fallaría, porque redb toma un lock exclusivo por base.
     fn get_or_create_shard(&self, agent_id: &AgentId) -> HiveResult<Arc<AgentShard>> {
-        match self.shards.get(agent_id) {
-            Some(entry) => Ok(Arc::clone(entry.value())),
-            None => {
+        use dashmap::mapref::entry::Entry;
+
+        let (shard, recien_abierto) = match self.shards.entry(agent_id.clone()) {
+            Entry::Occupied(entry) => (Arc::clone(entry.get()), false),
+            Entry::Vacant(entry) => {
                 let shard = Arc::new(AgentShard::open(self.shard_path(agent_id))?);
-                self.shards.insert(agent_id.clone(), Arc::clone(&shard));
-                Ok(shard)
+                entry.insert(Arc::clone(&shard));
+                (shard, true)
+            }
+        };
+
+        if recien_abierto {
+            self.known_agents.insert(agent_id.clone());
+            // Recuperar las proyecciones del shard aquí, y no al abrir la base,
+            // es lo que convierte el arranque en O(1) en vez de O(shards).
+            if self.recovered.insert(agent_id.clone()) {
+                Self::recover_shard_projections(&shard, &self.registry)?;
+            }
+            self.remember_open(agent_id);
+        }
+
+        Ok(shard)
+    }
+
+    /// Registra el shard como abierto y desaloja los más antiguos si hace falta.
+    ///
+    /// Sólo se desaloja un shard que nadie más esté usando (`strong_count == 1`,
+    /// comprobado bajo el lock del mapa): reabrir un fichero cuyo handle sigue
+    /// vivo fallaría por el lock exclusivo de redb. Un shard "en uso" se salta,
+    /// no se fuerza — la caché puede rebasar el tope un rato, que es preferible
+    /// a romper una escritura en curso.
+    fn remember_open(&self, agent_id: &AgentId) {
+        let mut order = self.open_order.lock().unwrap();
+        order.push_back(agent_id.clone());
+
+        // Los intentos se acotan al tamaño de la cola: si todos los shards
+        // están en uso no hay nada que desalojar, y rebasar el tope un rato es
+        // preferible a girar en vano o a cerrar algo que alguien está usando.
+        let mut intentos = order.len();
+        while order.len() > self.max_open_shards && intentos > 0 {
+            intentos -= 1;
+            let Some(candidato) = order.pop_front() else {
+                break;
+            };
+
+            // El recién abierto nunca es candidato: desalojarlo aquí obligaría
+            // a reabrirlo acto seguido.
+            if &candidato == agent_id {
+                order.push_back(candidato);
+                continue;
+            }
+
+            let desalojado = self
+                .shards
+                .remove_if(&candidato, |_, shard| Arc::strong_count(shard) == 1)
+                .is_some();
+
+            // Si no se pudo desalojar porque sigue en uso, vuelve a la cola
+            // para reintentarlo luego. Si ya no está en el mapa, se olvida:
+            // reencolarlo sería seguir la pista de algo que ya no existe.
+            if !desalojado && self.shards.contains_key(&candidato) {
+                order.push_back(candidato);
             }
         }
     }
 
-    fn load_existing_shards(&self) -> HiveResult<()> {
-        let mut max_seq = 0u64;
-        let entries = std::fs::read_dir(self.shards_dir())?;
-        for entry in entries {
+    /// Todos los agentes con shard, estén abiertos o no.
+    fn all_agents(&self) -> Vec<AgentId> {
+        self.known_agents.iter().map(|e| e.key().clone()).collect()
+    }
+
+    /// Shard de un agente para LEER. Devuelve `None` si ese agente no tiene
+    /// shard: abrirlo lo crearía —`AgentShard::open` hace `Database::create`—
+    /// y una consulta no debe dejar ficheros detrás.
+    fn shard_for_read(&self, agent_id: &AgentId) -> HiveResult<Option<Arc<AgentShard>>> {
+        if !self.known_agents.contains(agent_id) {
+            return Ok(None);
+        }
+        self.get_or_create_shard(agent_id).map(Some)
+    }
+
+    /// Censo de shards: sólo nombres de fichero. No abre ninguna base ni lee un
+    /// solo evento — es lo que hace que abrir cueste lo mismo con 10 shards que
+    /// con 10 000.
+    fn census_shards(&self) -> HiveResult<()> {
+        for entry in std::fs::read_dir(self.shards_dir())? {
             let entry = entry?;
             let path = entry.path();
             let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
@@ -94,23 +205,67 @@ impl EventLog {
             if ext != "redb" || name == "_global" {
                 continue;
             }
-
-            let agent_id = AgentId(name.to_string());
-            let shard = Arc::new(AgentShard::open(&path)?);
-            for event in shard.iter_events()? {
-                self.seq_to_agent.insert(event.seq, agent_id.clone());
-                if event.seq > max_seq {
-                    max_seq = event.seq;
-                }
-            }
-            self.shards.insert(agent_id, Arc::clone(&shard));
+            self.known_agents.insert(AgentId(name.to_string()));
         }
+        Ok(())
+    }
 
-        let scanned_next = max_seq + 1;
-        let stored_next = self.read_stored_next_seq()?.unwrap_or(1);
-        let next = scanned_next.max(stored_next);
+    /// Restaura `next_seq`.
+    ///
+    /// Tras un cierre ordenado basta con la meta del shard global. Si la sesión
+    /// anterior se cayó, el contador puede estar atrasado —los eventos no
+    /// globales no lo persisten, para no serializar todas las escrituras contra
+    /// el shard global— y hay que redescubrirlo escaneando.
+    ///
+    /// Una base creada por una versión anterior no tiene la marca de cierre
+    /// limpio, así que paga el escaneo una vez y ya queda al día.
+    fn restore_next_seq(&self) -> HiveResult<()> {
+        // El contador sólo es de fiar si EXISTE y además la sesión anterior
+        // cerró ordenadamente. Que falte es motivo de escaneo por sí solo: es
+        // el caso de una base escrita por una versión que aún no lo persistía.
+        let next = match (self.read_stored_next_seq()?, self.read_clean_shutdown()?) {
+            (Some(stored), true) => stored,
+            (stored, _) => stored.unwrap_or(1).max(self.rescan_max_seq()? + 1),
+        };
+
         self.next_seq.store(next, Ordering::SeqCst);
         self.write_stored_next_seq(next)?;
+        Ok(())
+    }
+
+    /// Camino de recuperación: recorre todos los shards para redescubrir el seq
+    /// más alto y rellenar el índice seq → agente. Caro y excepcional a
+    /// propósito — sólo tras un cierre sucio.
+    fn rescan_max_seq(&self) -> HiveResult<u64> {
+        let mut max_seq = 0u64;
+        for agent_id in self.all_agents() {
+            let shard = self.get_or_create_shard(&agent_id)?;
+            for event in shard.iter_events()? {
+                self.seq_to_agent.insert(event.seq, agent_id.clone());
+                max_seq = max_seq.max(event.seq);
+            }
+        }
+        Ok(max_seq)
+    }
+
+    fn read_clean_shutdown(&self) -> HiveResult<bool> {
+        let txn = self.global.db.begin_read()?;
+        let table = txn.open_table(META_TABLE)?;
+        Ok(table
+            .get(CLEAN_SHUTDOWN_KEY)?
+            .map(|v| v.value() == 1)
+            .unwrap_or(false))
+    }
+
+    /// Marca la base como abierta: si el proceso muere ahora, la próxima
+    /// apertura sabrá que tiene que escanear.
+    fn mark_dirty(&self) -> HiveResult<()> {
+        let txn = self.global.db.begin_write()?;
+        {
+            let mut table = txn.open_table(META_TABLE)?;
+            table.insert(CLEAN_SHUTDOWN_KEY, 0u64)?;
+        }
+        txn.commit()?;
         Ok(())
     }
 
@@ -120,9 +275,20 @@ impl EventLog {
         Ok(table.get("next_seq")?.map(|v| v.value()))
     }
 
+    /// Persiste el contador y marca el cierre como ordenado, en una sola
+    /// transacción: media verdad —contador nuevo con la marca vieja, o al
+    /// revés— dejaría la siguiente apertura escaneando de más o, peor,
+    /// confiando en un contador atrasado.
     pub(crate) fn flush_next_seq(&self) -> HiveResult<()> {
         let next = self.next_seq.load(Ordering::SeqCst);
-        self.write_stored_next_seq(next)
+        let txn = self.global.db.begin_write()?;
+        {
+            let mut table = txn.open_table(META_TABLE)?;
+            table.insert("next_seq", next)?;
+            table.insert(CLEAN_SHUTDOWN_KEY, 1u64)?;
+        }
+        txn.commit()?;
+        Ok(())
     }
 
     fn write_stored_next_seq(&self, value: u64) -> HiveResult<()> {
@@ -180,18 +346,16 @@ impl EventLog {
 
     /// Read a single event by sequence number.
     pub(crate) fn read(&self, seq: u64) -> HiveResult<Event> {
-        match self.seq_to_agent.get(&seq) {
-            Some(entry) => {
-                let agent_id = entry.value();
-                match self.shards.get(agent_id) {
-                    Some(shard) => match shard.read_event(seq)? {
-                        Some(event) => Ok(event),
-                        None => Err(HiveError::NotFound(format!("event seq={seq}"))),
-                    },
-                    None => Err(HiveError::NotFound(format!("shard for agent {agent_id}"))),
-                }
-            }
-            None => Err(HiveError::NotFound(format!("event seq={seq}"))),
+        let agent_id = match self.seq_to_agent.get(&seq) {
+            Some(entry) => entry.value().clone(),
+            None => return Err(HiveError::NotFound(format!("event seq={seq}"))),
+        };
+        match self.shard_for_read(&agent_id)? {
+            Some(shard) => match shard.read_event(seq)? {
+                Some(event) => Ok(event),
+                None => Err(HiveError::NotFound(format!("event seq={seq}"))),
+            },
+            None => Err(HiveError::NotFound(format!("shard for agent {agent_id}"))),
         }
     }
 
@@ -212,7 +376,7 @@ impl EventLog {
         agent_id: &AgentId,
         stream_id: &crate::event::StreamId,
     ) -> HiveResult<Vec<Event>> {
-        match self.shards.get(agent_id) {
+        match self.shard_for_read(agent_id)? {
             Some(shard) => {
                 let mut out = Vec::new();
                 for event in shard.iter_events()? {
@@ -226,14 +390,21 @@ impl EventLog {
         }
     }
 
-    /// Read all events for a stream across every agent shard, sorted by seq.
-    pub(crate) fn read_stream_all_agents(
+    /// Lee un stream restringido a un conjunto de agentes, ordenado por seq.
+    ///
+    /// Esta es la variante que debe usar cualquier consumidor multi-inquilino:
+    /// recorre `agents.len()` shards en vez de todos los de la base, así que ni
+    /// devuelve eventos de otros enjambres ni paga su coste.
+    pub(crate) fn read_stream_for_agents(
         &self,
+        agents: &[AgentId],
         stream_id: &crate::event::StreamId,
     ) -> HiveResult<Vec<Event>> {
         let mut out = Vec::new();
-        for entry in self.shards.iter() {
-            let shard = entry.value();
+        for agent_id in agents {
+            let Some(shard) = self.shard_for_read(agent_id)? else {
+                continue;
+            };
             for event in shard.iter_events()? {
                 if &event.stream_id == stream_id {
                     out.push(event);
@@ -244,19 +415,54 @@ impl EventLog {
         Ok(out)
     }
 
+    /// Read all events for a stream across every agent shard, sorted by seq.
+    ///
+    /// Recorre el log ENTERO de la base. En una base de un solo dueño es lo
+    /// correcto; si la base aloja varios inquilinos hay que usar
+    /// [`EventLog::read_stream_for_agents`], que además evita mezclar eventos
+    /// de enjambres distintos.
+    pub(crate) fn read_stream_all_agents(
+        &self,
+        stream_id: &crate::event::StreamId,
+    ) -> HiveResult<Vec<Event>> {
+        let agents = self.all_agents();
+        self.read_stream_for_agents(&agents, stream_id)
+    }
+
+    /// Estado de una proyección, restringido a un conjunto de agentes.
+    ///
+    /// Para proyecciones con scope `Agent` —el scope por defecto— el estado
+    /// vive repartido por shard y hay que mezclarlo. Mezclarlo TODO en una base
+    /// compartida significa sumar las estadísticas de otros inquilinos, así que
+    /// el consumidor multi-inquilino tiene que decir de quién pregunta.
+    pub(crate) fn project_for_agents<P: Projection>(
+        &self,
+        agents: &[AgentId],
+    ) -> HiveResult<P::State> {
+        if P::scope() == ProjectionScope::Global {
+            return self.global.project_local::<P>();
+        }
+        let mut whole = P::State::default();
+        for agent_id in agents {
+            let Some(shard) = self.shard_for_read(agent_id)? else {
+                continue;
+            };
+            let part = shard.project_local::<P>()?;
+            P::merge(&mut whole, &part);
+        }
+        Ok(whole)
+    }
+
     /// Query the current state of a projection.
+    ///
+    /// Mezcla los shards de TODA la base. Ver
+    /// [`EventLog::project_for_agents`] para el caso multi-inquilino.
     pub(crate) fn project<P: Projection>(&self) -> HiveResult<P::State> {
         if P::scope() == ProjectionScope::Global {
-            self.global.project_local::<P>()
-        } else {
-            let mut whole = P::State::default();
-            for entry in self.shards.iter() {
-                let shard = entry.value();
-                let part = shard.project_local::<P>()?;
-                P::merge(&mut whole, &part);
-            }
-            Ok(whole)
+            return self.global.project_local::<P>();
         }
+        let agents = self.all_agents();
+        self.project_for_agents::<P>(&agents)
     }
 
     /// Returns the last sequence number applied to a projection.
@@ -265,8 +471,10 @@ impl EventLog {
             self.global.projection_checkpoint::<P>()
         } else {
             let mut min: Option<u64> = None;
-            for entry in self.shards.iter() {
-                let shard = entry.value();
+            for agent_id in self.all_agents() {
+                let Some(shard) = self.shard_for_read(&agent_id)? else {
+                    continue;
+                };
                 let checkpoint = shard.projection_checkpoint::<P>()?;
                 min = Some(min.map_or(checkpoint, |m| m.min(checkpoint)));
             }
@@ -274,15 +482,12 @@ impl EventLog {
         }
     }
 
-    /// Rebuild any projection that is behind the durable log. Called once at open.
-    fn recover_projections(&self) -> HiveResult<()> {
-        // Recover agent-scoped projections in each shard.
-        for entry in self.shards.iter() {
-            let shard = entry.value();
-            Self::recover_shard_projections(shard, &self.registry)?;
-        }
-
-        // Recover global projections.
+    /// Reconstruye las proyecciones GLOBALES que estén por detrás del log.
+    ///
+    /// Las de scope `Agent` ya no se recuperan aquí: eso obligaba a abrir todos
+    /// los shards al arrancar. Cada shard recupera las suyas la primera vez que
+    /// se abre, dentro de `get_or_create_shard`.
+    fn recover_global_projections(&self) -> HiveResult<()> {
         let last_seq = self.last_seq()?;
         if last_seq > 0 {
             let from_seq = Self::min_global_checkpoint(&self.global, &self.registry)?;
@@ -376,8 +581,11 @@ impl EventLog {
 
     /// Wipe all materialized projection state and rebuild it from the log.
     pub(crate) fn wipe_projections_and_rebuild(&self) -> HiveResult<()> {
-        for entry in self.shards.iter() {
-            let shard = entry.value();
+        // Una reconstrucción total sí tiene que tocar todos los shards, no sólo
+        // los que estén abiertos: es una operación explícita y rara, no el
+        // camino caliente.
+        for agent_id in self.all_agents() {
+            let shard = self.get_or_create_shard(&agent_id)?;
             shard.wipe_and_rebuild_local(&self.registry)?;
         }
 
@@ -487,5 +695,87 @@ struct InMemoryEventReader {
 impl EventLogInternal for InMemoryEventReader {
     fn read_event(&self, seq: u64) -> HiveResult<Option<Event>> {
         Ok(self.events.iter().find(|e| e.seq == seq).cloned())
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+    use crate::clock::SystemClock;
+    use crate::event::{EventKind, StreamId};
+
+    /// Un `EventLog` con un tope de shards abiertos deliberadamente diminuto,
+    /// para que la evicción entre en juego con pocos agentes.
+    fn log_con_tope(dir: &std::path::Path, tope: usize) -> EventLog {
+        let mut log = EventLog::open(dir, ProjectionRegistry::empty(), Arc::new(SystemClock))
+            .expect("abrir log");
+        log.max_open_shards = tope;
+        log
+    }
+
+    fn hecho(agente: &str) -> EventInput {
+        EventInput::new(agente, StreamId::from("s"), EventKind::Fact)
+    }
+
+    /// El motivo de existir de la caché: una base compartida por muchos
+    /// enjambres acumula miles de shards, y cada uno es un descriptor y una
+    /// región mmap. Sin tope, abrir la base agota el `ulimit -n` del proceso.
+    #[test]
+    fn la_cache_de_shards_no_crece_sin_limite() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = log_con_tope(dir.path(), 4);
+
+        for i in 0..20 {
+            log.append(hecho(&format!("agente-{i}"))).unwrap();
+        }
+
+        assert!(
+            log.shards.len() <= 4,
+            "quedaron {} shards abiertos con un tope de 4",
+            log.shards.len()
+        );
+        // Desalojar es olvidar un handle, no perder datos: el censo sigue
+        // conociendo a los 20 agentes.
+        assert_eq!(log.known_agents.len(), 20);
+    }
+
+    /// Desalojar un shard no puede costar datos: al volver a tocarlo se reabre
+    /// y sus eventos siguen ahí.
+    #[test]
+    fn un_shard_desalojado_se_reabre_con_sus_datos() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = log_con_tope(dir.path(), 2);
+
+        let seq = log.append(hecho("agente-0")).unwrap().seq;
+        for i in 1..10 {
+            log.append(hecho(&format!("agente-{i}"))).unwrap();
+        }
+
+        let recuperados = log
+            .read_stream_for_agents(&[AgentId::from("agente-0")], &StreamId::from("s"))
+            .unwrap();
+        assert_eq!(recuperados.len(), 1);
+        assert_eq!(recuperados[0].seq, seq);
+    }
+
+    /// Un shard con una escritura viva no se puede cerrar: reabrirlo fallaría
+    /// por el lock exclusivo de redb. Ante la duda, la caché rebasa el tope.
+    #[test]
+    fn no_se_desaloja_un_shard_en_uso() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = log_con_tope(dir.path(), 1);
+
+        log.append(hecho("ocupado")).unwrap();
+        let retenido = log.get_or_create_shard(&AgentId::from("ocupado")).unwrap();
+
+        for i in 0..5 {
+            log.append(hecho(&format!("otro-{i}"))).unwrap();
+        }
+
+        assert!(
+            log.shards.contains_key(&AgentId::from("ocupado")),
+            "un shard con un Arc vivo fuera del mapa no debe desalojarse"
+        );
+        drop(retenido);
     }
 }

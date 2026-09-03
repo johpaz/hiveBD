@@ -112,6 +112,7 @@ fn long_running_task_resumes_with_full_causal_context() {
 
     let ctx = db
         .build_agent_context(AgentContextRequest {
+            agents: Vec::new(),
             task_id: "task-1".into(),
             current_phase: "session-3".into(),
             current_objective: "completar integración de pagos".into(),

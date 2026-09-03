@@ -121,6 +121,7 @@ fn build_context_never_exceeds_token_limit() {
 
     let ctx = db
         .build_agent_context(AgentContextRequest {
+            agents: Vec::new(),
             task_id: "task-1".into(),
             current_phase: "implementation".into(),
             current_objective: "fix payment module".into(),
@@ -150,6 +151,7 @@ fn causal_anchors_retrieves_distant_but_causally_connected_decisions() {
 
     let ctx = db
         .build_agent_context(AgentContextRequest {
+            agents: Vec::new(),
             task_id: "task-1".into(),
             current_phase: "".into(),
             current_objective: "NPE en pagos".into(),
@@ -173,6 +175,7 @@ fn completed_phases_are_compressed_not_dropped() {
 
     let ctx = db
         .build_agent_context(AgentContextRequest {
+            agents: Vec::new(),
             task_id: "task-1".into(),
             current_phase: "implementation".into(),
             current_objective: "".into(),
@@ -208,6 +211,7 @@ fn episodic_similarity_retrieves_past_relevant_episodes() {
 
     let ctx = db
         .build_agent_context(AgentContextRequest {
+            agents: Vec::new(),
             task_id: "task-current".into(),
             current_phase: "".into(),
             current_objective: "NPE en validación de pagos".into(),
@@ -256,6 +260,7 @@ fn recent_anomalies_always_included_in_context() {
 
     let ctx = db
         .build_agent_context(AgentContextRequest {
+            agents: Vec::new(),
             task_id: "task-1".into(),
             current_phase: "".into(),
             current_objective: "".into(),
@@ -280,6 +285,7 @@ fn build_context_is_idempotent() {
     seed_phase(&db, "task-1", "implementation", 500);
 
     let req = AgentContextRequest {
+        agents: Vec::new(),
         task_id: "task-1".into(),
         current_phase: "implementation".into(),
         current_objective: "fix pagos".into(),

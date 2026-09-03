@@ -77,5 +77,9 @@ path = "tests/g9d_e2e.rs"
 name = "g11_semantic_integrity"
 path = "tests/g11_semantic_integrity.rs"
 
+[[test]]
+name = "g12_tenant_isolation"
+path = "tests/g12_tenant_isolation.rs"
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

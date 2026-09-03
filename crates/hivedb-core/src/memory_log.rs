@@ -105,6 +105,21 @@ impl MemoryEventLog {
         Ok(out)
     }
 
+    pub(crate) fn read_stream_for_agents(
+        &self,
+        agents: &[AgentId],
+        stream_id: &StreamId,
+    ) -> HiveResult<Vec<Event>> {
+        let shards = self.shards.lock().unwrap();
+        let mut out: Vec<Event> = agents
+            .iter()
+            .filter_map(|agent| shards.get(agent))
+            .flat_map(|events| events.iter().filter(|e| &e.stream_id == stream_id).cloned())
+            .collect();
+        out.sort_by_key(|e| e.seq);
+        Ok(out)
+    }
+
     pub(crate) fn read_stream_all_agents(&self, stream_id: &StreamId) -> HiveResult<Vec<Event>> {
         let shards = self.shards.lock().unwrap();
         let mut out: Vec<Event> = shards

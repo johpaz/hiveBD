@@ -39,7 +39,7 @@ interface JsHiveDbInner {
   read(seq: number): Promise<JsEvent>;
   logLen(): Promise<number>;
   lastSeq(): Promise<number>;
-  toolStats(tool: string): Promise<JsToolStats | null>;
+  toolStats(tool: string, agents?: string[]): Promise<JsToolStats | null>;
   projectTaskState(agentId: string, streamId: string): Promise<string | null>;
   can(agent: string, action: string, resource: string): Promise<JsDecision>;
   indexDoc(
@@ -63,7 +63,7 @@ interface JsHiveDbInner {
   colFindBy(collection: string, field: string, valueJson: string, options?: JsScanOptions): Promise<JsDocEntry[]>;
   colBatch(ops: JsColOp[]): Promise<void>;
   queryHybrid(query: JsHybridQuery): Promise<JsHit[]>;
-  causalThread(streamId: string): Promise<string>;
+  causalThread(streamId: string, agents?: string[]): Promise<string>;
   buildAgentContext(reqJson: string): Promise<string>;
   evaluateHarness(inputJson: string): Promise<string>;
   workingSet(agentId: string, key: string, json: string, ttlMs?: number): Promise<void>;
@@ -229,6 +229,12 @@ export interface AgentContextRequest {
   currentObjective: string;
   maxTokens: number;
   strategy: ContextStrategy;
+  /**
+   * Restrict the causal thread to these agents. Omit (or leave empty) to walk
+   * every shard — correct when the database has a single owner, a cross-tenant
+   * read when it is shared.
+   */
+  agents?: string[];
 }
 
 export interface ContextStrategy {
@@ -500,8 +506,16 @@ export class HiveDB {
     return this.inner.lastSeq();
   }
 
-  async toolStats(tool: string): Promise<ToolStats | undefined> {
-    const stats = await this.inner.toolStats(tool);
+  /**
+   * Aggregated statistics for a tool.
+   *
+   * `ToolLedger` is an agent-scoped projection: without `agents` the state of
+   * every shard in the database is merged, which on a database shared by
+   * several tenants adds up calls that are not yours. Pass the agent ids
+   * whenever the database is shared.
+   */
+  async toolStats(tool: string, agents?: string[]): Promise<ToolStats | undefined> {
+    const stats = await this.inner.toolStats(tool, agents);
     return stats ?? undefined;
   }
 
@@ -514,8 +528,15 @@ export class HiveDB {
   }
 
   /** Build the causal thread for a task. */
-  async causalThread(streamId: string): Promise<unknown> {
-    return JSON.parse(await this.inner.causalThread(streamId));
+  /**
+   * Causal thread for a stream.
+   *
+   * `agents` restricts the scan to those agents' shards. Omitting it walks the
+   * whole log: correct for a single-owner database, a cross-tenant read (and an
+   * O(all events) cost) on a shared one.
+   */
+  async causalThread(streamId: string, agents?: string[]): Promise<unknown> {
+    return JSON.parse(await this.inner.causalThread(streamId, agents));
   }
 
   /** Build an adaptive, token-bounded context window for an agent. */

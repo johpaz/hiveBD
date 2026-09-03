@@ -17,6 +17,12 @@ pub struct AgentContextRequest {
     pub current_objective: String,
     pub max_tokens: usize,
     pub strategy: ContextStrategy,
+    /// Agentes a los que se limita el hilo causal. Vacío = toda la base, que es
+    /// el comportamiento histórico y el correcto cuando la base tiene un solo
+    /// dueño. Un consumidor multi-inquilino DEBE rellenarlo: si no, el contexto
+    /// se construye con eventos de otros enjambres.
+    #[serde(default)]
+    pub agents: Vec<crate::event::AgentId>,
 }
 
 /// Strategy knobs for context construction.
@@ -222,7 +228,11 @@ impl HiveDB {
     /// Build an adaptive, token-bounded context window for the current task.
     pub fn build_agent_context(&self, req: AgentContextRequest) -> HiveResult<AgentContext> {
         let stream_id = StreamId::from(req.task_id.clone());
-        let thread = self.causal_thread(stream_id.clone())?;
+        let thread = if req.agents.is_empty() {
+            self.causal_thread(stream_id.clone())?
+        } else {
+            self.causal_thread_for_agents(stream_id.clone(), &req.agents)?
+        };
 
         let mut items: Vec<ContextItem> = Vec::new();
         let mut included_seqs: HashSet<u64> = HashSet::new();

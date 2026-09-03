@@ -106,9 +106,29 @@ impl LogHandle {
         }
     }
 
+    fn read_stream_for_agents(
+        &self,
+        agents: &[AgentId],
+        stream_id: &StreamId,
+    ) -> HiveResult<Vec<Event>> {
+        match self {
+            LogHandle::Redb(log) => log.read_stream_for_agents(agents, stream_id),
+            #[cfg(any(test, loom))]
+            LogHandle::Memory(log) => log.read_stream_for_agents(agents, stream_id),
+        }
+    }
+
     fn project<P: Projection>(&self) -> HiveResult<P::State> {
         match self {
             LogHandle::Redb(log) => log.project::<P>(),
+            #[cfg(any(test, loom))]
+            LogHandle::Memory(log) => log.project::<P>(),
+        }
+    }
+
+    fn project_for_agents<P: Projection>(&self, agents: &[AgentId]) -> HiveResult<P::State> {
+        match self {
+            LogHandle::Redb(log) => log.project_for_agents::<P>(agents),
             #[cfg(any(test, loom))]
             LogHandle::Memory(log) => log.project::<P>(),
         }
@@ -288,8 +308,25 @@ impl HiveDB {
 
     /// Returns aggregated statistics for a tool, if any `ToolCall` events have
     /// been recorded for it.
+    /// Recorre los shards de TODA la base. `ToolLedger` tiene scope `Agent`, así
+    /// que sobre una base compartida por varios inquilinos esto suma las
+    /// llamadas de todos: usar [`HiveDB::tool_stats_for_agents`] en ese caso.
     pub fn tool_stats(&self, tool: &str) -> HiveResult<Option<ToolStats>> {
         let state = self.log.project::<ToolLedger>()?;
+        Ok(state.get(tool).cloned())
+    }
+
+    /// Estadísticas de una herramienta, restringidas a un conjunto de agentes.
+    ///
+    /// La variante que necesita un consumidor multi-inquilino: sin la lista, la
+    /// proyección mezcla el estado de todos los shards de la base y devuelve
+    /// agregados que cruzan enjambres.
+    pub fn tool_stats_for_agents(
+        &self,
+        tool: &str,
+        agents: &[AgentId],
+    ) -> HiveResult<Option<ToolStats>> {
+        let state = self.log.project_for_agents::<ToolLedger>(agents)?;
         Ok(state.get(tool).cloned())
     }
 
@@ -521,12 +558,30 @@ impl HiveDB {
     }
 
     /// Build the causal thread for a given stream.
+    ///
+    /// Recorre el log de TODA la base. Ver
+    /// [`HiveDB::causal_thread_for_agents`] para el caso multi-inquilino.
     pub fn causal_thread(
         &self,
         stream_id: impl Into<StreamId>,
     ) -> HiveResult<crate::causal::CausalThread> {
         let stream_id = stream_id.into();
         let events = self.log.read_stream_all_agents(&stream_id)?;
+        Ok(crate::causal::CausalThread::from_events(&events))
+    }
+
+    /// Hilo causal de un stream, restringido a un conjunto de agentes.
+    ///
+    /// Además de no cruzar inquilinos, el coste pasa de O(eventos de la base) a
+    /// O(eventos de esos agentes) — que es lo que vuelve viable llamar a esto
+    /// en cada turno cuando la base la comparten muchos enjambres.
+    pub fn causal_thread_for_agents(
+        &self,
+        stream_id: impl Into<StreamId>,
+        agents: &[AgentId],
+    ) -> HiveResult<crate::causal::CausalThread> {
+        let stream_id = stream_id.into();
+        let events = self.log.read_stream_for_agents(agents, &stream_id)?;
         Ok(crate::causal::CausalThread::from_events(&events))
     }
 }
