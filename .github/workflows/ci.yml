@@ -233,11 +233,27 @@ jobs:
         shell: bash
         run: ls -R ./npm
 
+      # Idempotente a propósito: si un release falla a medias, los paquetes de
+      # plataforma que sí llegaron a npm quedan publicados, y al reintentar el
+      # `npm publish` de esos devuelve 409 y tumbaba el job entero. Se salta lo
+      # que ya está en el registry en vez de darlo por error.
+      #
+      # El `set -euo pipefail` tampoco es decorativo: sin él, un fallo a mitad
+      # del bucle se tragaba en silencio porque el exit code del step es el del
+      # último comando.
       - name: Publish platform packages
         working-directory: packages/hive-db
+        shell: bash
         run: |
+          set -euo pipefail
           for triple in linux-x64-gnu linux-x64-musl linux-arm64-gnu darwin-x64 darwin-arm64 win32-x64-msvc; do
-            npm publish "./npm/${triple}" --access public
+            name=$(node -p "require('./npm/${triple}/package.json').name")
+            version=$(node -p "require('./npm/${triple}/package.json').version")
+            if npm view "${name}@${version}" version >/dev/null 2>&1; then
+              echo "· ${name}@${version} ya está publicado — se omite"
+            else
+              npm publish "./npm/${triple}" --access public
+            fi
           done
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
